@@ -1,4 +1,5 @@
-//! Sill host for Windows (owned by the Windows agent; see ../README.md and ../NOTES-windows.md).
+//! The console host for Windows (the library, src/lib.rs, has the backend; Sill.exe is the tray
+//! app, src/bin/sill.rs).
 //!
 //! The platform-independent parts (the HID → scancode table, the key state, Annex-B parsing, the
 //! pointer's arithmetic, the picture sizes, the image helpers) compile everywhere and are
@@ -14,20 +15,8 @@
 //!   sill-host-windows [--port=N] [--loopback] [--name=NAME] [--no-advertise] [--bitrate=MBPS] …
 //!       the host itself: sill-host-core's server with this backend (HostOptions::USAGE).
 
-#![cfg_attr(not(windows), allow(dead_code))]
-
-mod annexb;
-mod imaging;
-mod keymap;
-mod keys;
-mod pairview;
-mod pointer;
-mod sizing;
-
 #[cfg(windows)]
-mod selftest;
-#[cfg(windows)]
-mod win;
+use sill_host_windows::{selftest, win};
 
 #[cfg(windows)]
 fn main() {

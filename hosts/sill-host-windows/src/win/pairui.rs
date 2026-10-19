@@ -11,7 +11,7 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::time::Instant;
 
@@ -47,6 +47,8 @@ use crate::pairview::{Action, Buttons, PairView};
 const WM_EVENTS: u32 = WM_APP + 1;
 /// Lay the window out again (after a DPI change that came while it was busy).
 const WM_RELAYOUT: u32 = WM_APP + 2;
+/// Show the window (Sill.exe's "Pair iPhone or iPad…"), with a fresh code when none is open.
+const WM_SHOW: u32 = WM_APP + 3;
 
 const TIMER_TICK: usize = 1;
 const TIMER_LINGER: usize = 2;
@@ -98,12 +100,7 @@ pub fn post(event: PairingEvent, control: Arc<dyn PairingControl>) {
     if let Ok(mut q) = s.queue.lock() {
         q.push_back((event, control));
     }
-    static START: Once = Once::new();
-    START.call_once(|| {
-        if let Err(e) = std::thread::Builder::new().name("sill-pairing-window".into()).spawn(ui_thread) {
-            log(&format!("Pairing window: could not start its thread ({e}); the code is on the console."));
-        }
-    });
+    start_thread();
     // Before the window exists the UI thread drains the queue itself once it does.
     let h = s.hwnd.load(Ordering::Acquire);
     if h != 0 {
@@ -111,6 +108,49 @@ pub fn post(event: PairingEvent, control: Arc<dyn PairingControl>) {
             let _ = PostMessageW(Some(HWND(h as _)), WM_EVENTS, WPARAM(0), LPARAM(0));
         }
     }
+}
+
+fn start_thread() {
+    static START: Once = Once::new();
+    START.call_once(|| {
+        if let Err(e) = std::thread::Builder::new().name("sill-pairing-window".into()).spawn(ui_thread) {
+            log(&format!("Pairing window: could not start its thread ({e}); the code is on the console."));
+        }
+    });
+}
+
+/// Started at sign-in (Sill.exe's `--login`): the window does not come up by itself at the first
+/// code, only when asked for (a device's ask, the menu).
+static QUIET_START: AtomicBool = AtomicBool::new(false);
+/// "Pair iPhone or iPad…" came before the window existed.
+static SHOW_WHEN_MADE: AtomicBool = AtomicBool::new(false);
+
+pub fn set_quiet_start(on: bool) {
+    QUIET_START.store(on, Ordering::Release);
+}
+
+/// From any thread: the window comes up, in front (the menu's "Pair iPhone or iPad…"), showing
+/// the open code or, when none is (cancelled, stopped), a fresh one.
+pub fn show() {
+    unsafe {
+        // The tray's menu was in front: let the window's thread take the foreground.
+        let _ = windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(u32::MAX);
+    }
+    start_thread();
+    let h = shared().hwnd.load(Ordering::Acquire);
+    if h == 0 {
+        SHOW_WHEN_MADE.store(true, Ordering::Release);
+        return;
+    }
+    unsafe {
+        let _ = PostMessageW(Some(HWND(h as _)), WM_SHOW, WPARAM(0), LPARAM(0));
+    }
+}
+
+/// Whether the window shows now.
+pub fn visible() -> bool {
+    let h = shared().hwnd.load(Ordering::Acquire);
+    h != 0 && unsafe { IsWindowVisible(HWND(h as _)).as_bool() }
 }
 
 /// Everything the window holds, on its own thread.
@@ -122,6 +162,8 @@ struct Ui {
     fonts: Fonts,
     children: HashMap<i32, HWND>,
     placed: bool,
+    /// The menu asked for the window while no code was open: show the fresh one when it comes.
+    show_on_code: bool,
 }
 
 /// The QR code and where it is painted (read by WM_PAINT alone).
@@ -203,6 +245,8 @@ fn ui_thread() {
             lpfnWndProc: Some(wndproc),
             hInstance: instance,
             hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+            // Sill.exe's icon (resource 1); the console host has none, and gets Windows' own.
+            hIcon: windows::Win32::UI::WindowsAndMessaging::LoadIconW(Some(instance), PCWSTR(1 as _)).unwrap_or_default(),
             lpszClassName: class,
             ..Default::default()
         };
@@ -278,11 +322,15 @@ fn ui_thread() {
                 fonts,
                 children,
                 placed: false,
+                show_on_code: false,
             })
         });
         shared().hwnd.store(hwnd.0 as isize, Ordering::Release);
         // Whatever queued before the window existed.
         let _ = PostMessageW(Some(hwnd), WM_EVENTS, WPARAM(0), LPARAM(0));
+        if SHOW_WHEN_MADE.swap(false, Ordering::AcqRel) {
+            let _ = PostMessageW(Some(hwnd), WM_SHOW, WPARAM(0), LPARAM(0));
+        }
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             if !IsDialogMessageW(hwnd, &msg).as_bool() {
@@ -298,6 +346,18 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         match msg {
             WM_EVENTS => {
                 drain();
+                LRESULT(0)
+            }
+            WM_SHOW => {
+                with_ui(|ui| {
+                    if ui.view.counting() {
+                        ui.act(Action::Show { activate: true });
+                    } else if let Some(c) = ui.control.clone() {
+                        // The core opens a fresh code; its event shows the window (`drain`).
+                        ui.show_on_code = true;
+                        c.new_code();
+                    }
+                });
                 LRESULT(0)
             }
             WM_RELAYOUT => {
@@ -401,7 +461,14 @@ fn drain() {
         let handled = with_ui(|ui| {
             ui.control = Some(control.clone());
             let visible = unsafe { IsWindowVisible(ui.hwnd).as_bool() };
-            let action = ui.view.apply(event.clone(), Instant::now(), visible);
+            let is_code = matches!(event, PairingEvent::Code { .. });
+            let mut action = ui.view.apply(event.clone(), Instant::now(), visible);
+            if is_code && ui.show_on_code {
+                ui.show_on_code = false;
+                action = Action::Show { activate: true };
+            } else if action == (Action::Show { activate: true }) && QUIET_START.load(Ordering::Acquire) {
+                action = Action::Refresh;
+            }
             ui.act(action);
         });
         if handled.is_none() {

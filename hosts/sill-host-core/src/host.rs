@@ -2,20 +2,22 @@
 //! coordinator's loop until Ctrl-C.
 
 use crate::catalog::Catalog;
-use crate::config::HostConfig;
+use crate::config::{ConfigChange, HostConfig};
 use crate::coordinator::{Coordinator, CoordinatorOptions};
 use crate::door::{Door, DoorKind};
 use crate::origin;
 use crate::pairing::{Pairing, RemoteDoor, Store};
 use crate::platform::Platform;
 use crate::server::{Route, Server};
+use crate::status::{DeviceStatus, HostStatus, Published};
 use crate::transport::PlainTransport;
 use crate::{log, stats, Event};
 use sill_protocol::identity::{mac_id, random_bytes, short_name};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
 use std::path::PathBuf;
-use std::sync::mpsc::channel;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -45,6 +47,12 @@ pub struct HostOptions {
     pub advertise: bool,
     /// The streaming knobs at launch (`--bitrate=MBPS`, `--max-fps=N`, `--standard` for half scale).
     pub config: HostConfig,
+    /// The app keeps settings changes across runs (Sill.exe): devices are told (kind 16's
+    /// `persistent`). False for the CLI, whose changes last until it quits.
+    pub persistent: bool,
+    /// Pairing codes and links in the log: the CLI's way to show them. False for an app that
+    /// shows them in a window and keeps its log in a file (Sill.exe).
+    pub codes_in_log: bool,
 }
 
 impl Default for HostOptions {
@@ -59,6 +67,8 @@ impl Default for HostOptions {
             name: None,
             advertise: true,
             config: HostConfig::standard(),
+            persistent: false,
+            codes_in_log: true,
         }
     }
 }
@@ -139,13 +149,25 @@ fn bind(opts: &HostOptions, port: u16) -> std::io::Result<TcpListener> {
     }
     let any6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port);
     let s = socket2::Socket::new(socket2::Domain::IPV6, socket2::Type::STREAM, Some(socket2::Protocol::TCP));
-    if let Ok(s) = s {
-        let _ = s.set_only_v6(false);
+    if let Ok(s) = s.and_then(|s| s.set_only_v6(false).map(|_| s)) {
+        // A restart rebinds at once on Unix. Never on Windows: there SO_REUSEADDR lets a second
+        // socket bind a port another host is listening on, and the two then split connections.
+        #[cfg(not(windows))]
         let _ = s.set_reuse_address(true);
-        if s.bind(&any6.into()).is_ok() && s.listen(64).is_ok() {
-            return Ok(s.into());
+        match s.bind(&any6.into()) {
+            Ok(()) => {
+                s.listen(64)?;
+                return Ok(s.into());
+            }
+            // The port is taken (or reserved): say so. Falling back to IPv4 alone would "work" on
+            // Windows, which lets an IPv4 listener share a port with another's dual-stack one.
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied) => {
+                return Err(e)
+            }
+            Err(_) => {}
         }
     }
+    // No dual stack here (IPv6 off): IPv4 alone.
     TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port))
 }
 
@@ -180,16 +202,29 @@ fn reset_already(s: &std::net::TcpStream) -> bool {
 
 /// Runs the host until Ctrl-C (or SIGTERM): listens, serves devices, then says goodbye to each.
 pub fn run(platform: Arc<dyn Platform>, opts: HostOptions) -> Result<(), String> {
+    let host = start(platform, opts)?;
+    log("Nothing is streaming yet: pick a window or the desktop on the device. Ctrl-C to stop.");
+    // Ctrl-C / SIGTERM: goodbye "quit" to every device, then return; a second one exits at once.
+    let handle = host.handle();
+    let _ = ctrlc::set_handler(move || {
+        if handle.stopping() {
+            std::process::exit(130);
+        }
+        handle.quit();
+    });
+    host.join()
+}
+
+/// Starts a host and returns while it runs: the listeners bound (a port in use fails here, before
+/// anything else starts, so a caller may try again), the doors open, advertised, the coordinator
+/// on a thread of its own. `Host::handle` is what an app's own UI holds (Sill.exe's tray).
+pub fn start(platform: Arc<dyn Platform>, opts: HostOptions) -> Result<Host, String> {
     let name = opts.name.clone().unwrap_or_else(|| platform.machine_name());
-    let (tx, rx) = channel::<Event>();
-    let server = Server::new(tx.clone());
-    let reader = platform.clone();
-    server.set_pointer_reader(Box::new(move || reader.pointer_location()));
-    let catalog = Catalog::new(platform.clone(), server.clone(), tx.clone());
     // --pairing: the identity, the trust list and the pairing window (the TLS home door).
     let pairing = if opts.pairing || opts.remote.is_some() {
         let store = Store::open(opts.config_dir.clone())?;
         let p = Pairing::new(store, &name)?;
+        p.set_codes_in_log(opts.codes_in_log);
         // The platform's own pairing window, if it has one, hears of every code (the console too).
         let ui = platform.clone();
         p.set_observer(move |event, control| ui.pairing_changed(event, control));
@@ -205,6 +240,17 @@ pub fn run(platform: Arc<dyn Platform>, opts: HostOptions) -> Result<(), String>
     };
     let listener = bind(&opts, opts.port).map_err(|e| format!("Listener failed: {e}"))?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+    let remote_listener = match (opts.remote, &pairing) {
+        (Some(remote_port), Some(_)) => {
+            Some(bind(&opts, remote_port).map_err(|e| format!("Remote access couldn’t start ({e})."))?)
+        }
+        _ => None,
+    };
+    let (tx, rx) = channel::<Event>();
+    let server = Server::new(tx.clone());
+    let reader = platform.clone();
+    server.set_pointer_reader(Box::new(move || reader.pointer_location()));
+    let catalog = Catalog::new(platform.clone(), server.clone(), tx.clone());
     stats::start_printing();
     catalog.start();
     if opts.loopback {
@@ -219,8 +265,7 @@ pub fn run(platform: Arc<dyn Platform>, opts: HostOptions) -> Result<(), String>
         ));
         start_plain_door(listener, server.clone())?;
     }
-    if let (Some(remote_port), Some(p)) = (opts.remote, &pairing) {
-        let l = bind(&opts, remote_port).map_err(|e| format!("Remote access couldn’t start ({e})."))?;
+    if let (Some(l), Some(p)) = (remote_listener, &pairing) {
         let bound = l.local_addr().map_err(|e| e.to_string())?.port();
         p.set_remote(Some(RemoteDoor { port: bound, internet: opts.internet, loopback: opts.loopback, home_tls: opts.pairing }));
         log(&format!("Remote access: listening on port {bound} (TLS, paired devices only; {} paired).", p.paired_count()));
@@ -230,7 +275,7 @@ pub fn run(platform: Arc<dyn Platform>, opts: HostOptions) -> Result<(), String>
         start_tls_door(l, Door::new(DoorKind::Remote { internet: opts.internet }, p.clone(), server.clone()))?;
     }
     if let Some(p) = &pairing {
-        // A pairing window is always open: its code goes to stdout only.
+        // A pairing window is always open: its code goes to stdout (and the platform's window).
         p.open_window(None, true);
         let ticker = p.clone();
         std::thread::Builder::new()
@@ -244,42 +289,143 @@ pub fn run(platform: Arc<dyn Platform>, opts: HostOptions) -> Result<(), String>
     // Bonjour, through the platform: a TLS door's record carries `r` (a fresh recognition tag) and
     // `p` ("1": pairing required).
     let txt = pairing.as_ref().map(|p| p.txt(opts.pairing)).unwrap_or_default();
-    let _advertisement = if opts.advertise {
+    let (advertisement, advertised) = if opts.advertise {
         match platform.advertise(&name, port, &txt) {
             Ok(guard) => {
                 log(&format!("Advertising _sill._tcp as \"{name}\" on port {port}."));
-                Some(guard)
+                (Some(guard), Some(Ok(())))
             }
             Err(e) => {
                 log(&format!("Not advertised ({e}); devices reach this host by address."));
-                None
+                (None, Some(Err(e)))
             }
         }
     } else {
-        None
+        (None, None)
     };
-    log("Nothing is streaming yet: pick a window or the desktop on the device. Ctrl-C to stop.");
-    // Ctrl-C / SIGTERM: goodbye "quit" to every device, then return.
-    let (done_tx, done_rx) = channel::<()>();
-    let stop_tx = Mutex::new(Some((tx.clone(), done_tx)));
-    let _ = ctrlc::set_handler(move || {
-        if let Some((tx, done)) = stop_tx.lock().unwrap().take() {
-            let _ = tx.send(Event::Shutdown(done));
-        } else {
-            std::process::exit(130);
-        }
+    let config = opts.config.clone().validated();
+    let published = Arc::new(Mutex::new(Published { stream: None, config: config.clone() }));
+    let handle = Arc::new(HostHandle {
+        events: Mutex::new(tx.clone()),
+        stopping: AtomicBool::new(false),
+        name: name.clone(),
+        port,
+        home_tls: opts.pairing,
+        advertised,
+        server: server.clone(),
+        pairing: pairing.clone(),
+        published: published.clone(),
     });
     let coordinator = Coordinator::new(
         platform.clone(),
-        server.clone(),
+        server,
         catalog,
         tx,
-        CoordinatorOptions { mac_name: name, launch_id: launch_id(), pairing, config: opts.config.clone() },
+        CoordinatorOptions { mac_name: name, launch_id: launch_id(), pairing, config, persistent: opts.persistent, published },
     );
-    coordinator.run(rx);
-    let _ = done_rx.recv_timeout(Duration::from_secs(2));
-    log("Stopped.");
-    Ok(())
+    let thread = std::thread::Builder::new()
+        .name("sill-coordinator".into())
+        .spawn(move || coordinator.run(rx))
+        .map_err(|e| e.to_string())?;
+    Ok(Host { handle, thread: Some(thread), advertisement })
+}
+
+/// A running host (`start`): its handle, and the coordinator's thread to wait for.
+pub struct Host {
+    handle: Arc<HostHandle>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    /// Advertised until the host stops.
+    advertisement: Option<Box<dyn Send>>,
+}
+
+impl Host {
+    pub fn handle(&self) -> Arc<HostHandle> {
+        self.handle.clone()
+    }
+
+    /// Waits until the host stopped (after `HostHandle::quit`: every device told goodbye), then
+    /// stops advertising. Err when the coordinator died instead (a panic).
+    pub fn join(mut self) -> Result<(), String> {
+        let result = match self.thread.take() {
+            Some(t) => t.join().map_err(|_| "the host stopped unexpectedly".to_string()),
+            None => Ok(()),
+        };
+        drop(self.advertisement.take());
+        log("Stopped.");
+        result
+    }
+}
+
+/// What an app's own UI holds of a running host: what it is doing, a settings change, quit.
+/// Shared across threads; every call returns at once.
+pub struct HostHandle {
+    events: Mutex<Sender<Event>>,
+    stopping: AtomicBool,
+    name: String,
+    port: u16,
+    home_tls: bool,
+    advertised: Option<Result<(), String>>,
+    server: Arc<Server>,
+    pairing: Option<Arc<Pairing>>,
+    published: Arc<Mutex<Published>>,
+}
+
+impl HostHandle {
+    /// Goodbye "quit" to every device, then the host stops (`Host::join` returns). Once; later
+    /// calls do nothing.
+    pub fn quit(&self) {
+        if self.stopping.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        // `join` waits for the coordinator's thread itself; nobody needs to hear `done`.
+        let (done, _) = channel::<()>();
+        if let Ok(tx) = self.events.lock() {
+            let _ = tx.send(Event::Shutdown(done));
+        }
+    }
+
+    /// `quit` was called.
+    pub fn stopping(&self) -> bool {
+        self.stopping.load(Ordering::Acquire)
+    }
+
+    /// The fields `change` sets, laid over the live settings: logged, the stream restarted when
+    /// what it runs changed, every device told (kind 16), as a device's own change is.
+    pub fn change(&self, change: ConfigChange) {
+        if let Ok(tx) = self.events.lock() {
+            let _ = tx.send(Event::Change(change));
+        }
+    }
+
+    /// What the host is doing now.
+    pub fn status(&self) -> HostStatus {
+        let published = self.published.lock().map(|p| p.clone()).unwrap_or_else(|e| e.into_inner().clone());
+        let devices = self
+            .server
+            .client_ids()
+            .into_iter()
+            .filter_map(|id| self.server.client(id))
+            .map(|c| {
+                let (name, route) = match &c.route {
+                    Route::HomeTls { paired_name: Some(n), .. } => (n.clone(), None),
+                    Route::Remote { name, label, .. } => (name.clone(), Some(label.clone())),
+                    _ => (c.name(), None),
+                };
+                let report = *c.report.lock().unwrap_or_else(|e| e.into_inner());
+                DeviceStatus { name, endpoint: c.endpoint.clone(), route, report }
+            })
+            .collect();
+        HostStatus {
+            name: self.name.clone(),
+            port: self.port,
+            home_tls: self.home_tls,
+            advertised: self.advertised.clone(),
+            devices,
+            stream: published.stream,
+            config: published.config,
+            paired: self.pairing.as_ref().map(|p| p.paired_count()).unwrap_or(0),
+        }
+    }
 }
 
 /// The plain door (no TLS): admits only this machine's own networks (OriginPolicy.homeAdmits).
@@ -327,4 +473,77 @@ fn start_plain_door(listener: TcpListener, srv: Arc<Server>) -> Result<(), Strin
         })
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ffmpeg::HevcEncoder;
+    use crate::synthetic::SyntheticPlatform;
+    use sill_protocol::wire::{Header, Kind, HEADER_LEN};
+    use std::io::Read;
+    use std::net::TcpStream;
+
+    fn options(port: u16) -> HostOptions {
+        HostOptions { port, loopback: true, advertise: false, persistent: true, ..HostOptions::default() }
+    }
+
+    fn platform() -> Arc<dyn Platform> {
+        Arc::new(SyntheticPlatform::new(HevcEncoder::Libx265))
+    }
+
+    /// The next kind 16 a plain-door client reads, as JSON.
+    fn next_settings(conn: &mut TcpStream) -> serde_json::Value {
+        loop {
+            let mut head = [0u8; HEADER_LEN];
+            conn.read_exact(&mut head).expect("a header");
+            let h = Header::parse(&head).expect("a valid header");
+            let mut payload = vec![0u8; h.payload_len as usize];
+            conn.read_exact(&mut payload).expect("a payload");
+            if h.kind == Kind::HostSettings {
+                return serde_json::from_slice(&payload).expect("kind 16 is JSON");
+            }
+        }
+    }
+
+    #[test]
+    fn the_handle_changes_settings_reports_them_and_quits() {
+        let host = start(platform(), options(0)).expect("starts");
+        let handle = host.handle();
+        let s = handle.status();
+        assert_eq!((s.home_tls, s.advertised.clone(), s.devices.len(), s.stream.clone()), (false, None, 0, None));
+        assert_eq!(s.config, HostConfig::standard());
+        // A device on the plain door: its kind 16 says changes are kept, then carries the host's change.
+        let mut conn = TcpStream::connect(("127.0.0.1", s.port)).expect("connects");
+        conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let first = next_settings(&mut conn);
+        assert_eq!(first["persistent"], serde_json::json!(true), "{first}");
+        assert_eq!(first["settings"]["bitrate"], serde_json::json!(15_000_000));
+        handle.change(ConfigChange { bitrate: Some(25_000_000), ..Default::default() });
+        let second = next_settings(&mut conn);
+        assert_eq!(second["settings"]["bitrate"], serde_json::json!(25_000_000), "{second}");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while handle.status().config.bitrate != 25_000_000 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(handle.status().config.bitrate, 25_000_000);
+        assert_eq!(handle.status().devices.len(), 1);
+        // Quit (twice: the second does nothing) returns well inside the old 2 s wait.
+        let t = Instant::now();
+        handle.quit();
+        handle.quit();
+        assert!(handle.stopping());
+        host.join().expect("stops cleanly");
+        assert!(t.elapsed() < Duration::from_millis(1500), "{:?}", t.elapsed());
+    }
+
+    #[test]
+    fn a_second_host_on_the_same_port_fails_to_start() {
+        let first = start(platform(), options(0)).expect("starts");
+        let port = first.handle().status().port;
+        let second = start(platform(), options(port));
+        assert!(second.as_ref().err().is_some_and(|e| e.starts_with("Listener failed")), "{:?}", second.as_ref().err());
+        first.handle().quit();
+        first.join().unwrap();
+    }
 }

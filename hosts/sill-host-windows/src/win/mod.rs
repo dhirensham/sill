@@ -8,10 +8,14 @@ pub mod cursor;
 pub mod d3d;
 pub mod dnssd;
 pub mod encoder;
+pub mod firewall;
 pub mod gdi;
 pub mod input;
+pub mod login;
+pub mod logwindow;
 pub mod pairui;
 pub mod stream;
+pub mod tray;
 pub mod util;
 pub mod winops;
 
@@ -183,6 +187,9 @@ impl Platform for WindowsPlatform {
     }
 
     fn pairing_changed(&self, event: PairingEvent, control: Arc<dyn PairingControl>) {
+        // Sill.exe's menu shows a device's ask too; the console host has no tray, and the call
+        // only notes it.
+        tray::note_pairing(&event);
         pairui::post(event, control);
     }
 }

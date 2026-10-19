@@ -233,6 +233,9 @@ pub struct Pairing {
     remote: Mutex<Option<RemoteDoor>>,
     /// The host's own pairing UI, if its platform has one (`Platform::pairing_changed`).
     observer: Mutex<Option<Observer>>,
+    /// Codes and links go into the log (the CLI's stdout); off for an app that shows them in a
+    /// window of its own and keeps a log file (Sill.exe), as Sill.app never logs one.
+    codes_in_log: std::sync::atomic::AtomicBool,
 }
 
 type Observer = Arc<dyn Fn(PairingEvent, Arc<dyn PairingControl>) + Send + Sync>;
@@ -255,7 +258,27 @@ impl Pairing {
             link_port: 7455,
             remote: Mutex::new(None),
             observer: Mutex::new(None),
+            codes_in_log: std::sync::atomic::AtomicBool::new(true),
         }))
+    }
+
+    pub fn set_codes_in_log(&self, on: bool) {
+        self.codes_in_log.store(on, std::sync::atomic::Ordering::Release);
+    }
+
+    /// "1234 5678 9012 or sill://pair?…" for the log (`code` puts "code " in front, as the asked
+    /// line has it), or where to find it when codes stay out of the log.
+    fn offered(&self, code: &str, link: &str) -> String {
+        self.offered_as(code, link, false)
+    }
+
+    fn offered_as(&self, code: &str, link: &str, with_word: bool) -> String {
+        match (self.codes_in_log.load(std::sync::atomic::Ordering::Acquire), with_word) {
+            (true, false) => format!("{} or {link}", grouped(code)),
+            (true, true) => format!("code {} or {link}", grouped(code)),
+            (false, false) => "the code in the pairing window".into(),
+            (false, true) => "the pairing window shows the code".into(),
+        }
     }
 
     /// Who hears of every change to the pairing window (the platform's UI). Set before the first
@@ -407,17 +430,17 @@ impl Pairing {
         if first {
             match &door {
                 Some(d) => {
-                    log(&format!("Remote access for this run on port {} (TLS, paired devices only). Pair with {} or {link}", d.port, grouped(&code)));
+                    log(&format!("Remote access for this run on port {} (TLS, paired devices only). Pair with {}", d.port, self.offered(&code, &link)));
                     if d.home_tls {
                         log("Pairing required for this run (TLS on the home door).");
                     }
                 }
-                None => log(&format!("Pairing required for this run (TLS on the home door). Pair with {} or {link}", grouped(&code))),
+                None => log(&format!("Pairing required for this run (TLS on the home door). Pair with {}", self.offered(&code, &link))),
             }
         } else if let Some((_, who)) = asked_by {
-            log(&format!("Pairing: {who} asked; code {} or {link}", grouped(&code)));
-        } else {
-            log(&format!("Pairing: new code {} or {link}", grouped(&code)));
+            log(&format!("Pairing: {who} asked; {}", self.offered_as(&code, &link, true)));
+        } else if self.codes_in_log.load(std::sync::atomic::Ordering::Acquire) {
+            log(&format!("Pairing: new code {}", self.offered(&code, &link)));
         }
         self.emit(PairingEvent::Code {
             code,
@@ -445,7 +468,7 @@ impl Pairing {
         let open = self.state.lock().unwrap().window.as_ref().map(|w| (w.secret.clone(), w.for_remote, w.code.clone()));
         if let Some((secret, for_remote, code)) = open {
             let link = self.link_for(&secret, for_remote);
-            log(&format!("Pairing: {who} asked; code {} or {link}", grouped(&code)));
+            log(&format!("Pairing: {who} asked; {}", self.offered_as(&code, &link, true)));
             self.emit(PairingEvent::Asked { device: who.to_string() });
         }
     }

@@ -2,6 +2,32 @@
 
 Owner: the Windows agent. Scope: `hosts/sill-host-windows/**` and this file.
 
+## Status (2026-10-19: Sill.exe, the tray app)
+
+- `Sill.exe` (src/bin/sill.rs, `windows_subsystem = "windows"`): the host as Sill.app is on the Mac,
+  with no console. The crate is a library (src/lib.rs) with two binaries; `sill-host-windows.exe`
+  is the console host as before (as SillHost). Sill.exe: one per sign-in session (a second launch
+  makes the first say where it is); settings in `%APPDATA%\Sill\settings.json` (port 7454 by
+  default so one firewall rule fits; frame rate, quality, resolution, the away pair, speed), saved
+  when the menu or a device changes them; the log in `%LOCALAPPDATA%\Sill\Sill.log` (time-stamped,
+  moved to Sill.1.log at 10 MB, no pairing code or link in it) and in memory for Show Log; TLS
+  pairing on; the host started on a worker thread after the icon shows.
+- The tray menu, Sill.app's (`traymenu.rs`): the status card's header and lines (Waiting for a
+  Device, ‹iPad› Connected, Streaming to ‹iPad›, Sill Couldn't Start; each device's fps, frame age,
+  RTT, route; the stream's window, size, fps, Mbps), ⚠ rows (‹device› Wants to Pair, Allow Sill
+  Through Windows Firewall…, This Network Is Public…, Try Again), Frame Rate, Quality (an off-preset
+  bitrate checked and greyed), Resolution, Windows Firewall (in place of Permissions), Launch at
+  Login, Pair iPhone or iPad…, Show Log…, Quit Sill. Left out for now: the Settings window, Remote
+  Access, and the Mac-only Virtual Display and Direct Wireless.
+- Verified on this PC (Windows 11, 175 %): the menu in Windows 11's own style (screenshots), each
+  item through the test hook (Quality › Pro: one "Settings:" line, settings.json, ✓ moved; Pair
+  brings the window up; Show Log; Launch at Login writes and removes the Run value); Quit (goodbye,
+  "Stopped.", the icon removed, within 20 ms); the four glyphs at 28 px, white on the dark taskbar;
+  the firewall item Allowed with the TCP 7454 port rule and Not Allowed on an unused port (the ⚠
+  row and glyph); two hosts on one port refused; Sill.exe's icon and version in Explorer. Not yet:
+  Allow… through UAC, a device's ask row, Explorer restarting, sign-out, a light taskbar, Launch at
+  Login across a real sign-in.
+
 ## Status (2026-10-19: first run on a PC)
 
 - Run on Windows 11 Pro (build 28120) on an XPS 13 (Intel graphics, 175 % scaling) against the App
@@ -59,6 +85,17 @@ Owner: the Windows agent. Scope: `hosts/sill-host-windows/**` and this file.
 | `win/stream.rs` | The stream thread: newest WGC frame → copied into our own BGRA texture (the capture buffer goes back at once) → converter → encoder, paced to `fps`, frames dropped never queued. Keyframe requests ride the next frame, or re-encode the last picture once the source has been still 50 ms. A content size that holds for 150 ms rebuilds converter and encoder. A hardware encoder that errors, is full with nothing back for 1.5 s, or keeps new frames out for 1.5 s without asking for input is replaced by the software one, once (the hung one is torn down on a thread of its own, since a wedged driver can block its teardown); then the stream ends with the reason. A still source whose encoder still holds a frame after 100 ms gets the last picture once more, so the last change reaches the devices. `timeBeginPeriod(1)` while streaming (60/120 fps pacing). `source_rect`: the window's frame bounds or the monitor's rect, physical px. |
 | `win/mod.rs` | `WindowsPlatform`; per-monitor-v2 DPI awareness set once at start (so window rects, capture, SendInput and GetCursorPos all speak physical pixels); `release_input()`. |
 | `selftest.rs` | `--selftest` / `--list` (below). |
+| `bin/sill.rs` | Sill.exe's `main`: `win::tray::run(--login?)`. |
+| `applog.rs` (portable) | The log sink: Sill.log (local time in front, Sill.1.log at 10 MB; `SILL_TEST_LOG_ROTATE_BYTES`) and the last 5,000 lines for the log window; a panic is logged. |
+| `settings.rs` (portable) | settings.json: `#[serde(default)]`, unknown keys ignored, values snapped to the menu's, written whole then renamed. |
+| `traymenu.rs` (portable) | The tray's card and menu as data (StatusText.swift's rules, MenuBuilder's order); `dump` writes it as Sill.app's menu.txt (`SILL_TEST_MENU_DUMP`). |
+| `glyph.rs` (portable) | StatusGlyph.swift's four glyphs as coverage masks at any size (4×4 samples a pixel). |
+| `fwpolicy.rs` (portable) | Whether the firewall lets devices in on the port, from its profiles and rules, in Windows' order; only a rule for the port itself (no program, no service, any address or the local subnet, Wi-Fi/LAN) counts as allowing, a block rule for Sill.exe counts. |
+| `win/tray.rs` | The icon (a hidden top-level window: TaskbarCreated, WM_SETTINGCHANGE, WM_ENDSESSION reach it), `Shell_NotifyIconW` v4, the menu (TrackPopupMenuEx + TPM_RETURNCMD, no state held across it), a 1 s tick (glyph, tooltip "Sill — ‹header›", settings saved), Quit with a 3 s hard exit, sign-out's goodbye. TEST ONLY: `SILL_TEST_ACTIONS=1` (WM_APP+20 does a menu action, so tests never type into the screen), `SILL_TEST_ICON_DUMP=<dir>` (each icon as a PNG). |
+| `win/logwindow.rs` | "Sill Log": an EDIT (limit raised, appends without undo, the oldest 500 cut past 5,500), Show per-second stats, Clear, Open Log Folder. |
+| `win/login.rs` | Launch at Login: HKCU Run `Sill` = `"…\Sill.exe" --login`; StartupApproved's "off" (Task Manager) honoured: the menu sends the person to Settings › Startup. `--login` keeps the pairing window down at sign-in. |
+| `win/firewall.rs` | INetFwPolicy2 read on a worker thread (every minute; the menu shows the last answer); Allow… = elevated `netsh … localport=7454 profile=private` (one UAC prompt; declined changes nothing; not added when already allowed). |
+| `res/Sill.ico` | The Mac app's icon (design/AppIcon.svg rendered by Edge, cut to its rounded square), 16–256 px; `build.rs` embeds it with a version resource in Sill.exe only (embed-resource). |
 | `pairview.rs` (portable) | The pairing window's state and words from the core's `PairingEvent`s (Sill.app's PairDeviceWindow): the host's own code ("tap ‹host›", "Can’t scan? …", New Code, Close), a device's ask over it, a window a device's ask opened ("‹device› on this network asked to pair.", "Didn’t ask for this? Click Cancel."), a wrong code, "Paired with ‹device›." for 3 s then closed, Stopped; when it comes up (at the start only when nothing is paired; an ask brings it up without the keyboard). |
 | `win/pairui.rs` | "Pair iPhone or iPad": one Win32 window on a thread of its own, made at the first pairing event; the core's threads queue events and post a message. STATIC controls for the words (Narrator reads them), the QR code painted with GDI (`qrcodegen`, MIT), the system's buttons (Common Controls v6 through `build.rs`'s embedded manifest, MSVC only), per-monitor DPI. Close only hides it (the host's code keeps working, as the console's); Cancel on a device-opened window is `PairingControl::cancel`. |
 

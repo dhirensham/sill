@@ -17,6 +17,25 @@ pub struct HostConfig {
     pub prioritize_speed: bool,
 }
 
+impl Default for HostConfig {
+    fn default() -> Self {
+        HostConfig::standard()
+    }
+}
+
+/// A change from the host's own UI (Sill.exe's menu, as Sill.app's menu and Settings): only the
+/// fields it sets, each laid over the live config (`HostConfig::with`), so a menu built a moment
+/// ago never puts back what a device changed since.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ConfigChange {
+    pub max_fps: Option<i64>,
+    pub bitrate: Option<i64>,
+    pub capture_scale: Option<f64>,
+    pub away_bitrate: Option<i64>,
+    pub away_capture_scale: Option<f64>,
+    pub prioritize_speed: Option<bool>,
+}
+
 impl HostConfig {
     /// `HostConfig.standard`'s streaming knobs: 120 fps ceiling, Retina, Balanced (15 Mbps).
     pub fn standard() -> HostConfig {
@@ -108,6 +127,30 @@ impl HostConfig {
         }
         if let Some(v) = c.capture_scale {
             n.capture_scale = v;
+        }
+        if let Some(v) = c.prioritize_speed {
+            n.prioritize_speed = v;
+        }
+        n
+    }
+
+    /// This config with the host's own change laid over it (`ConfigChange`), not yet validated.
+    pub fn with(&self, c: &ConfigChange) -> HostConfig {
+        let mut n = self.clone();
+        if let Some(v) = c.max_fps {
+            n.max_fps = v;
+        }
+        if let Some(v) = c.bitrate {
+            n.bitrate = v;
+        }
+        if let Some(v) = c.capture_scale {
+            n.capture_scale = v;
+        }
+        if let Some(v) = c.away_bitrate {
+            n.away_bitrate = v;
+        }
+        if let Some(v) = c.away_capture_scale {
+            n.away_capture_scale = v;
         }
         if let Some(v) = c.prioritize_speed {
             n.prioritize_speed = v;

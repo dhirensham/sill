@@ -27,6 +27,10 @@ pub struct CoordinatorOptions {
     /// MacInfo) follows it in every catalog, as SillHost --pairing does.
     pub pairing: Option<Arc<crate::pairing::Pairing>>,
     pub config: HostConfig,
+    /// Changes are kept across runs (Sill.exe saves them): kind 16's `persistent`.
+    pub persistent: bool,
+    /// Where the stream and the settings go after every change, for the host's own UI.
+    pub published: Arc<Mutex<crate::status::Published>>,
 }
 
 #[derive(Clone, Debug)]
@@ -42,6 +46,8 @@ struct Running {
     window_app: Option<String>,
     /// The encoded picture, once the first frame said.
     size: Option<(u32, u32)>,
+    /// "App — Title" for a window (the host's status display); None for the desktop.
+    window: Option<String>,
 }
 
 #[derive(Default)]
@@ -158,6 +164,10 @@ impl Coordinator {
                             }
                         }
                     }
+                }
+                Event::Change(change) => {
+                    let after = self.config.with(&change).validated();
+                    self.apply_config(after, None);
                 }
                 Event::Shutdown(done) => {
                     self.stop_stream();
@@ -481,7 +491,8 @@ impl Coordinator {
                 self.stream = Some(stream);
                 self.active = source;
                 self.catalog.set_active(if let StreamSource::Window(id) = source { Some(id) } else { None });
-                self.running = Some(Running { fps, bitrate, away, window_size, window_app, size: None });
+                let window = matches!(source, StreamSource::Window(_)).then(|| describe.clone());
+                self.running = Some(Running { fps, bitrate, away, window_size, window_app, size: None, window });
                 self.server.set_streaming(true);
                 self.server.set_pointer_rect(self.stream.as_ref().and_then(|s| s.source_rect()));
                 log(&format!(
@@ -662,7 +673,7 @@ impl Coordinator {
         let this_away = self.is_away(id);
         HostSettingsState {
             settings: self.config.stream_settings_for(this_away),
-            persistent: false,
+            persistent: self.opts.persistent,
             virtual_display_available: false,
             virtual_display_note: Some("This host has no virtual display.".into()),
             software_encoder: false,
@@ -695,6 +706,40 @@ impl Coordinator {
             self.published.insert(id, state.clone());
             self.server.send(id, message_now(Kind::HostSettings, &to_json(&state)));
         }
+        // And to the host's own UI.
+        let stream = self.running.as_ref().map(|r| crate::status::StreamStatus {
+            window: r.window.clone(),
+            size: r.size,
+            fps: r.fps,
+            mbps: r.bitrate / 1_000_000,
+        });
+        if let Ok(mut p) = self.opts.published.lock() {
+            *p = crate::status::Published { stream, config: self.config.clone() };
+        }
+    }
+
+    /// A new config from a device (`who`) or the host's own UI (None): logged, the stream
+    /// restarted when what it runs changed, every device told. False when nothing changed.
+    fn apply_config(&mut self, after: HostConfig, who: Option<&str>) -> bool {
+        let before = self.config.clone();
+        if after == before {
+            return false;
+        }
+        match who {
+            Some(who) => log(&format!("Settings from {who}: {}", before.changes(&after))),
+            None => log(&format!("Settings: {}", before.changes(&after))),
+        }
+        self.config = after.clone();
+        let fps_before = self.running.as_ref().map(|r| r.fps);
+        let away = self.away_wanted();
+        let restart = before.effective(away) != after.effective(away)
+            || before.prioritize_speed != after.prioritize_speed
+            || fps_before.map(|f| f != self.effective_fps()).unwrap_or(false);
+        if restart && self.active != StreamSource::None {
+            self.select(self.active, false);
+        }
+        self.publish_settings();
+        true
     }
 
     fn change_settings(&mut self, id: ClientId, payload: &[u8]) {
@@ -723,19 +768,7 @@ impl Coordinator {
             let before = self.config.clone();
             // A device away from home sets the away quality, never the home one.
             let after = if self.is_away(id) { before.applying_away(&ok) } else { before.applying(&ok) }.validated();
-            if after != before {
-                log(&format!("Settings from {who}: {}", before.changes(&after)));
-                self.config = after.clone();
-                let fps_before = self.running.as_ref().map(|r| r.fps);
-                let away = self.away_wanted();
-                let restart = before.effective(away) != after.effective(away)
-                    || before.prioritize_speed != after.prioritize_speed
-                    || fps_before.map(|f| f != self.effective_fps()).unwrap_or(false);
-                if restart && self.active != StreamSource::None {
-                    self.select(self.active, false);
-                }
-                self.publish_settings();
-            }
+            self.apply_config(after, Some(&who));
         }
         // Exactly one answer, to this device alone: the settings as they now stand.
         let answer = self.settings_state(id, change.token);

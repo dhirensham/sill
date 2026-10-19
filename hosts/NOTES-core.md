@@ -2,6 +2,28 @@
 
 ## Status (newest first)
 
+- **2026-10-19, for Sill.exe (the Windows tray app):**
+  - `host::start(platform, opts) -> Result<Host, String>`: what `run()` did up to the coordinator,
+    which now runs on a thread of its own; the listeners are bound first, so a port in use fails
+    before any thread starts (an app may try again). `Host::handle()` is a `HostHandle`:
+    `status()` (a `status::HostStatus`: name, port, TLS or not, advertised, each device with its
+    last report, what streams, the settings, paired count), `change(ConfigChange)` (the fields a
+    menu item sets, laid over the live settings: one restart rule and kind 16 for everyone, shared
+    with a device's kind 17 through `apply_config`), `quit()` (once; goodbye, then `Host::join`
+    returns at once: no 2 s wait). `run()` is `start` + Ctrl-C → `quit` + `join`; its output is
+    as before.
+  - `HostOptions.persistent` → kind 16's `persistent` (the app saves changes);
+    `HostOptions.codes_in_log` (true for the CLI): false keeps pairing codes and links out of the
+    log ("Pair with the code in the pairing window"), as Sill.app never logs one.
+  - `set_log_sink(f)`: every `log` line to `f` instead of stdout (stdout stays the default).
+  - Two fixes in `bind()` (found running two hosts on one port on Windows): no SO_REUSEADDR on
+    Windows (it lets a second socket bind a listening port), and no IPv4 fallback when the dual-
+    stack bind fails with "in use" or "access denied" (Windows lets an IPv4 listener share a port
+    with another's dual-stack one, so the second host "started" and they split connections). Now
+    the second fails: "Listener failed: … (os error 10048)". `stats::start_printing` runs once a
+    process.
+  - Tests: `host::tests` (start, a device's kind 16 with `persistent` and the handle's change,
+    status, quit in well under 2 s; a second host on the same port fails).
 - **2026-10-19, for the Windows pairing window and a first run on a PC:**
   - `Platform::pairing_changed(event, control)` (additive, default no-op; "Trait changes"): every
     change to the pairing window as a `PairingEvent` (a code with its link, expiry, asker, paired
@@ -86,6 +108,14 @@ fn main() {
   lines go ("Client connected: …", "[1s] enc.out 60  net.sent 60 …", "Test input: …").
 - Stats: `sill_host_core::stats::bump("key")` adds to the once-a-second line (use your own keys,
   e.g. `cap.frames`, `cap.dropped`).
+
+An app with its own UI (Sill.exe) uses `start` instead and keeps the `Host`:
+
+```rust
+let host = sill_host_core::start(platform, options)?;      // a port in use fails here
+let handle = host.handle();                                 // status(), change(..), quit()
+// … later, from the UI: handle.quit(); host.join()?;
+```
 
 ### What the core calls, and from where
 

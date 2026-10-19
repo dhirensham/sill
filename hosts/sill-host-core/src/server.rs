@@ -96,6 +96,8 @@ pub struct Client {
     cv: Condvar,
     closer: Box<dyn Fn() + Send + Sync>,
     pub device: Mutex<Option<String>>,
+    /// The device's last report (kind 12), for the host's own status display.
+    pub report: Mutex<Option<crate::status::DeviceReport>>,
     hello_seen: AtomicBool,
 }
 
@@ -331,6 +333,7 @@ impl Server {
             cv: Condvar::new(),
             closer,
             device: Mutex::new(None),
+            report: Mutex::new(None),
             hello_seen: AtomicBool::new(false),
         });
         let count = {
@@ -472,6 +475,8 @@ impl Server {
     fn client_stats(&self, client: &Client, s: ClientStats) {
         let name = label(&s.device);
         *client.device.lock().unwrap() = if name.is_empty() { None } else { Some(name.clone()) };
+        *client.report.lock().unwrap() =
+            Some(crate::status::DeviceReport { fps: s.fps, frame_age_ms: s.frame_age_ms, rtt_ms: s.rtt_ms });
         let mut st = client.state.lock().unwrap();
         st.worst_age = st.worst_age.max(s.frame_age_max_ms.unwrap_or(-1));
         st.worst_rtt = st.worst_rtt.max(s.rtt_max_ms.unwrap_or(-1));

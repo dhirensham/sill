@@ -29,8 +29,13 @@ pub fn add(key: &'static str, n: u64) {
 }
 
 /// Prints the line every second while there is something to say, the heartbeat every 30 s when
-/// idle. Runs until the process ends.
+/// idle. Runs until the process ends; once per process, however often a host starts.
 pub fn start_printing() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(spawn_printer);
+}
+
+fn spawn_printer() {
     std::thread::Builder::new()
         .name("sill-stats".into())
         .spawn(|| {

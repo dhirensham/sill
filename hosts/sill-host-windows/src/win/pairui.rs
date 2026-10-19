@@ -21,10 +21,10 @@ use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect, GetDC, GetMonitorInfoW,
-    GetStockObject, MonitorFromPoint, ReleaseDC, SelectObject, SetBkColor, SetTextColor, CLEARTYPE_QUALITY,
+    MonitorFromPoint, ReleaseDC, SelectObject, SetBkColor, SetTextColor, CLEARTYPE_QUALITY,
     CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DT_CALCRECT, DT_NOPREFIX, DT_SINGLELINE, DT_WORDBREAK, FF_DONTCARE,
     FONT_CHARSET, FW_NORMAL, FW_SEMIBOLD, HBRUSH, HDC, HFONT, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTOPRIMARY,
-    OUT_DEFAULT_PRECIS, PAINTSTRUCT, WHITE_BRUSH,
+    OUT_DEFAULT_PRECIS, PAINTSTRUCT, RedrawWindow, RDW_ALLCHILDREN, RDW_ERASE, RDW_FRAME, RDW_INVALIDATE,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::{InitCommonControlsEx, ICC_STANDARD_CLASSES, INITCOMMONCONTROLSEX};
@@ -36,7 +36,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     BS_PUSHBUTTON, CS_HREDRAW, CS_VREDRAW, FLASHWINFO, FLASHW_TIMERNOFG, FLASHW_TRAY, HMENU, HWND_NOTOPMOST,
     HWND_TOPMOST, IDC_ARROW, MSG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
     SW_HIDE, SW_SHOWNOACTIVATE, SW_SHOWNORMAL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_COMMAND,
-    WM_CTLCOLORBTN, WM_CTLCOLORSTATIC, WM_DPICHANGED, WM_ERASEBKGND, WM_PAINT, WM_SETFONT, WM_TIMER, WNDCLASSEXW,
+    WM_CTLCOLORBTN, WM_CTLCOLORSTATIC, WM_DPICHANGED, WM_ERASEBKGND, WM_PAINT, WM_SETFONT, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSEXW,
     WS_CAPTION, WS_CHILD, WS_EX_CONTROLPARENT, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP,
 };
 
@@ -75,13 +75,55 @@ const SS_NOPREFIX: u32 = 0x80;
 const STATICS: [i32; 9] = [ID_HEADLINE, ID_BODY, ID_SCAN, ID_CODE_LABEL, ID_CODE, ID_COUNTDOWN, ID_WARNING, ID_NOTE0, ID_NOTE1];
 
 // Colours (COLORREF is 0x00BBGGRR).
-const INK: u32 = 0x001A1A1A;
-const SECONDARY: u32 = 0x005D5D5D;
-const FAINT: u32 = 0x00BDBDBD;
-const WARNING: u32 = 0x00005CB8; // #B85C00
-const SUCCESS: u32 = 0x000F7B0F; // #0F7B0F
+// The words' colours are the theme's (`theme::palette`); the QR code is black on a white card in
+// both themes (a light code on dark is one many scanners can't read).
 const QR_DARK: u32 = 0x00000000;
 const QR_SPENT: u32 = 0x00D9D9D9;
+const QR_CARD: u32 = 0x00FFFFFF;
+
+/// The window is drawn dark (the app mode, `theme::dark`), for the colour messages.
+static DARK: AtomicBool = AtomicBool::new(false);
+
+fn palette() -> super::theme::Palette {
+    super::theme::palette(DARK.load(Ordering::Acquire))
+}
+
+/// The background's brush for the current theme (made again when the theme changes).
+fn background_brush() -> HBRUSH {
+    thread_local! {
+        static BRUSH: RefCell<Option<(u32, HBRUSH)>> = const { RefCell::new(None) };
+    }
+    let colour = palette().background;
+    BRUSH.with(|b| {
+        let mut b = b.borrow_mut();
+        match *b {
+            Some((c, brush)) if c == colour => brush,
+            _ => {
+                if let Some((_, old)) = b.take() {
+                    unsafe {
+                        let _ = DeleteObject(HGDIOBJ(old.0));
+                    }
+                }
+                let brush = unsafe { CreateSolidBrush(COLORREF(colour)) };
+                *b = Some((colour, brush));
+                brush
+            }
+        }
+    })
+}
+
+/// The window's title bar and buttons in the app mode's theme.
+fn apply_theme(hwnd: HWND, children: &HashMap<i32, HWND>) {
+    let dark = super::theme::dark();
+    DARK.store(dark, Ordering::Release);
+    super::theme::allow_dark(hwnd, dark);
+    super::theme::title_bar(hwnd, dark);
+    for id in [ID_LEFT, ID_RIGHT] {
+        if let Some(h) = children.get(&id) {
+            super::theme::control(*h, dark);
+        }
+    }
+}
 
 /// What other threads share with the UI thread.
 struct Shared {
@@ -313,6 +355,7 @@ fn ui_thread() {
                 children.insert(id, h);
             }
         }
+        apply_theme(hwnd, &children);
         UI.with(|ui| {
             *ui.borrow_mut() = Some(Ui {
                 hwnd,
@@ -416,7 +459,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 let hdc = HDC(wparam.0 as _);
                 let mut r = RECT::default();
                 let _ = windows::Win32::UI::WindowsAndMessaging::GetClientRect(hwnd, &mut r);
-                FillRect(hdc, &r, HBRUSH(GetStockObject(WHITE_BRUSH).0));
+                FillRect(hdc, &r, background_brush());
                 LRESULT(1)
             }
             WM_PAINT => {
@@ -433,12 +476,24 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             WM_CTLCOLORSTATIC => {
                 let hdc = HDC(wparam.0 as _);
                 let id = GetDlgCtrlID(HWND(lparam.0 as _));
-                let color = COLORS.with(|c| c.borrow().get(&id).copied()).unwrap_or(INK);
+                let p = palette();
+                let color = COLORS.with(|c| c.borrow().get(&id).copied()).unwrap_or(p.ink);
                 SetTextColor(hdc, COLORREF(color));
-                SetBkColor(hdc, COLORREF(0x00FFFFFF));
-                LRESULT(GetStockObject(WHITE_BRUSH).0 as isize)
+                SetBkColor(hdc, COLORREF(p.background));
+                LRESULT(background_brush().0 as isize)
             }
-            WM_CTLCOLORBTN => LRESULT(GetStockObject(WHITE_BRUSH).0 as isize),
+            WM_CTLCOLORBTN => LRESULT(background_brush().0 as isize),
+            WM_SETTINGCHANGE => {
+                if super::theme::is_theme_change(lparam) {
+                    // Light or dark changed: the title bar, the buttons, the colours, all of it redrawn.
+                    with_ui(|ui| {
+                        apply_theme(ui.hwnd, &ui.children);
+                        ui.layout();
+                    });
+                    let _ = RedrawWindow(Some(hwnd), None, None, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_FRAME);
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
     }
@@ -629,13 +684,13 @@ impl Ui {
             ID_HEADLINE,
             content.headline.as_deref(),
             self.fonts.headline,
-            if content.success { SUCCESS } else { INK },
+            if content.success { palette().success } else { palette().ink },
             pad,
             inner,
             &mut y,
             s(6),
         );
-        put(self, hdc, &mut colors, ID_BODY, content.body.as_deref(), self.fonts.body, INK, pad, inner, &mut y, gap);
+        put(self, hdc, &mut colors, ID_BODY, content.body.as_deref(), self.fonts.body, palette().ink, pad, inner, &mut y, gap);
 
         // The QR code: whole modules, a quiet zone of four, centred.
         let qr = content.qr.as_ref().and_then(|(text, spent)| QrCode::encode_text(text, QrCodeEcc::Medium).ok().map(|c| (c, *spent)));
@@ -650,7 +705,7 @@ impl Ui {
         });
         QR.with(|q| *q.borrow_mut() = qr_paint);
 
-        put(self, hdc, &mut colors, ID_SCAN, content.scan_hint.as_deref(), self.fonts.body, INK, pad, inner, &mut y, s(6));
+        put(self, hdc, &mut colors, ID_SCAN, content.scan_hint.as_deref(), self.fonts.body, palette().ink, pad, inner, &mut y, s(6));
 
         // "Code" and the digits on one row.
         let code_label = self.children.get(&ID_CODE_LABEL).copied();
@@ -668,8 +723,8 @@ impl Ui {
                 set_text(code, digits);
                 let code_x = pad + label_w + s(14);
                 place(code, code_x, y, width - pad - code_x, code_h, true);
-                colors.insert(ID_CODE_LABEL, SECONDARY);
-                colors.insert(ID_CODE, if *spent { FAINT } else { INK });
+                colors.insert(ID_CODE_LABEL, palette().secondary);
+                colors.insert(ID_CODE, if *spent { palette().faint } else { palette().ink });
                 y += code_h + s(4);
             }
             (_, label, code) => {
@@ -678,10 +733,10 @@ impl Ui {
                 }
             }
         }
-        put(self, hdc, &mut colors, ID_COUNTDOWN, content.countdown.as_deref(), self.fonts.small, SECONDARY, pad, inner, &mut y, gap);
-        put(self, hdc, &mut colors, ID_WARNING, content.warning.as_deref(), self.fonts.body, WARNING, pad, inner, &mut y, gap);
-        put(self, hdc, &mut colors, ID_NOTE0, content.notes.first().map(String::as_str), self.fonts.small, SECONDARY, pad, inner, &mut y, s(4));
-        put(self, hdc, &mut colors, ID_NOTE1, content.notes.get(1).map(String::as_str), self.fonts.small, SECONDARY, pad, inner, &mut y, s(4));
+        put(self, hdc, &mut colors, ID_COUNTDOWN, content.countdown.as_deref(), self.fonts.small, palette().secondary, pad, inner, &mut y, gap);
+        put(self, hdc, &mut colors, ID_WARNING, content.warning.as_deref(), self.fonts.body, palette().warning, pad, inner, &mut y, gap);
+        put(self, hdc, &mut colors, ID_NOTE0, content.notes.first().map(String::as_str), self.fonts.small, palette().secondary, pad, inner, &mut y, s(4));
+        put(self, hdc, &mut colors, ID_NOTE1, content.notes.get(1).map(String::as_str), self.fonts.small, palette().secondary, pad, inner, &mut y, s(4));
 
         // The buttons, right-aligned; the right one is the default.
         y += s(12);
@@ -747,6 +802,9 @@ fn paint_qr(hdc: HDC, q: &QrPaint) {
     let modules = n + 8;
     let module = (q.rect.right - q.rect.left) / modules;
     unsafe {
+        let card = CreateSolidBrush(COLORREF(QR_CARD));
+        FillRect(hdc, &q.rect, card);
+        let _ = DeleteObject(HGDIOBJ(card.0));
         let brush = CreateSolidBrush(COLORREF(if q.spent { QR_SPENT } else { QR_DARK }));
         for my in 0..n {
             for mx in 0..n {

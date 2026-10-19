@@ -19,7 +19,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     BS_PUSHBUTTON, BM_GETCHECK, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY, HMENU,
     IDC_ARROW, SB_BOTTOM, SB_VERT, SCROLLINFO, SIF_ALL, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOWNORMAL, WINDOW_EX_STYLE,
     WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_SETFONT, WM_SETTEXT, WM_SIZE, WM_TIMER,
-    WM_VSCROLL, WNDCLASSEXW, WS_BORDER, WS_CHILD, WS_HSCROLL, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    WM_VSCROLL, WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_ERASEBKGND, WM_SETTINGCHANGE, WNDCLASSEXW, WS_BORDER, WS_CHILD, WS_HSCROLL, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 
 use super::util::wide;
@@ -33,6 +33,13 @@ const TIMER_PULL: usize = 1;
 const CLASS: PCWSTR = w!("SillLogWindow");
 /// Lines kept in the view; past it the oldest 500 go at once.
 const VIEW_LINES: i32 = 5_000;
+
+/// The window is drawn dark (the colour messages read it).
+static DARK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn palette() -> super::theme::Palette {
+    super::theme::palette(DARK.load(std::sync::atomic::Ordering::Acquire))
+}
 
 struct LogWindow {
     hwnd: HWND,
@@ -112,6 +119,7 @@ pub fn show() {
         let dpi = GetDpiForWindow(hwnd).max(96);
         let mut w = LogWindow { hwnd, text, stats, clear, folder, font: HFONT::default(), ui_font: HFONT::default(), dpi, seen: 0 };
         w.fonts();
+        w.theme();
         // 900 × 520 points at this display's scale.
         let s = |v: i32| v * dpi as i32 / 96;
         let _ = SetWindowPos(hwnd, None, 0, 0, s(900), s(520), windows::Win32::UI::WindowsAndMessaging::SWP_NOMOVE | SWP_NOZORDER);
@@ -125,6 +133,17 @@ pub fn show() {
 }
 
 impl LogWindow {
+    /// The title bar, the text's scroll bars and the buttons in the app mode's theme.
+    fn theme(&self) {
+        let dark = super::theme::dark();
+        DARK.store(dark, std::sync::atomic::Ordering::Release);
+        super::theme::allow_dark(self.hwnd, dark);
+        super::theme::title_bar(self.hwnd, dark);
+        for h in [self.text, self.stats, self.clear, self.folder] {
+            super::theme::control(h, dark);
+        }
+    }
+
     fn fonts(&mut self) {
         let px = |dip: i32| -(dip * self.dpi as i32 / 96);
         unsafe {
@@ -262,6 +281,42 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 });
                 layout();
                 LRESULT(0)
+            }
+            WM_ERASEBKGND => {
+                let mut r = RECT::default();
+                let _ = GetClientRect(hwnd, &mut r);
+                windows::Win32::Graphics::Gdi::FillRect(windows::Win32::Graphics::Gdi::HDC(wparam.0 as _), &r, super::theme::brush(palette().background));
+                LRESULT(1)
+            }
+            // The read-only text and the checkbox draw as statics; the buttons' corners as buttons.
+            WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT => {
+                let hdc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as _);
+                let p = palette();
+                windows::Win32::Graphics::Gdi::SetTextColor(hdc, windows::Win32::Foundation::COLORREF(p.ink));
+                windows::Win32::Graphics::Gdi::SetBkColor(hdc, windows::Win32::Foundation::COLORREF(p.background));
+                LRESULT(super::theme::brush(p.background).0 as isize)
+            }
+            WM_CTLCOLORBTN => LRESULT(super::theme::brush(palette().background).0 as isize),
+            WM_SETTINGCHANGE => {
+                if super::theme::is_theme_change(lparam) {
+                    WINDOW.with(|c| {
+                        if let Ok(b) = c.try_borrow() {
+                            if let Some(w) = b.as_ref() {
+                                w.theme();
+                            }
+                        }
+                    });
+                    let _ = windows::Win32::Graphics::Gdi::RedrawWindow(
+                        Some(hwnd),
+                        None,
+                        None,
+                        windows::Win32::Graphics::Gdi::RDW_INVALIDATE
+                            | windows::Win32::Graphics::Gdi::RDW_ERASE
+                            | windows::Win32::Graphics::Gdi::RDW_ALLCHILDREN
+                            | windows::Win32::Graphics::Gdi::RDW_FRAME,
+                    );
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
             }
             WM_CLOSE => {
                 let _ = KillTimer(Some(hwnd), TIMER_PULL);

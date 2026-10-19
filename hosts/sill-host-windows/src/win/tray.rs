@@ -130,6 +130,8 @@ pub fn note_pairing(event: &PairingEvent) {
 pub fn run(login: bool) -> i32 {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        // Menus in the app mode's theme, light or dark (theme.rs).
+        super::theme::init_app();
         // One Sill.exe: a second launch asks the first to say where it is, and goes.
         let _mutex = CreateMutexW(None, true, w!("Local\\Sill.Tray.Instance"));
         if GetLastError() == ERROR_ALREADY_EXISTS {
@@ -231,6 +233,8 @@ fn make_window() -> Option<HWND> {
         };
         RegisterClassExW(&wc);
         let hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, CLASS, w!("Sill"), WS_POPUP, 0, 0, 0, 0, None, None, Some(instance), None).ok()?;
+        // Its menus may draw dark.
+        super::theme::allow_dark(hwnd, true);
         TRAY_HWND.store(hwnd.0 as isize, Ordering::Release);
         Some(hwnd)
     }
@@ -311,7 +315,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     let host = with_tray(|t| {
                         t.quitting = true;
                         t.remove_icon();
-                        t.handle.as_ref().map(|h| h.quit());
+                        if let Some(h) = &t.handle {
+                            h.quit();
+                        }
                         t.host.take()
                     })
                     .flatten();
@@ -327,7 +333,11 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 LRESULT(0)
             }
             WM_DISPLAYCHANGE | WM_SETTINGCHANGE => {
-                // A new DPI or taskbar theme: the glyph is drawn again at the next tick.
+                // A new DPI or taskbar theme: the glyph is drawn again at the next tick; a new app
+                // mode: the next menu takes it.
+                if msg == WM_SETTINGCHANGE && super::theme::is_theme_change(lparam) {
+                    super::theme::refresh_menus();
+                }
                 with_tray(|t| t.icon_stale());
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }

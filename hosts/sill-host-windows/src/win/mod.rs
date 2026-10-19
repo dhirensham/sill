@@ -15,6 +15,7 @@ pub mod login;
 pub mod logwindow;
 pub mod pairui;
 pub mod stream;
+pub mod theme;
 pub mod tray;
 pub mod util;
 pub mod winops;

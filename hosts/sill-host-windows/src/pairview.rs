@@ -224,7 +224,7 @@ impl PairView {
                     }
                     None => {
                         c.headline = self.asked.as_ref().map(|who| format!("{who} asked to pair."));
-                        c.body = Some(format!("In Sill on your iPhone or iPad, tap {}, then point it at this code.", self.host));
+                        c.body = Some(format!("Open Sill on your iPhone or iPad, tap {}, then point it at this code.", self.host));
                         c.scan_hint = Some("Can’t scan? Tap Enter Code Instead, and type:".into());
                         c.notes = vec![device_note];
                     }
@@ -282,7 +282,7 @@ mod tests {
         let c = v.content(now);
         assert_eq!(c.code, Some(("1234 5678 9012".into(), false)));
         assert_eq!(c.countdown.as_deref(), Some("Works once, for the next 5:00."));
-        assert_eq!(c.body.as_deref(), Some("In Sill on your iPhone or iPad, tap XPS13, then point it at this code."));
+        assert_eq!(c.body.as_deref(), Some("Open Sill on your iPhone or iPad, tap XPS13, then point it at this code."));
         assert_eq!(c.buttons, Buttons::NewCodeClose);
         assert_eq!(c.headline, None);
     }

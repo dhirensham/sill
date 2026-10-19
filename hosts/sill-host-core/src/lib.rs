@@ -55,7 +55,8 @@ pub fn log(line: &str) {
     let _ = out.flush();
 }
 
-static LOG_SINK: std::sync::OnceLock<Box<dyn Fn(&str) + Send + Sync>> = std::sync::OnceLock::new();
+type LogSink = Box<dyn Fn(&str) + Send + Sync>;
+static LOG_SINK: std::sync::OnceLock<LogSink> = std::sync::OnceLock::new();
 
 /// Where every `log` line goes instead of stdout, for an app with no console (Sill.exe: a file and
 /// its log window). Once per process, before the host starts; false if a sink was already set.

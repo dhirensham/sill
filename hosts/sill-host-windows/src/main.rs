@@ -12,6 +12,9 @@
 //!       DIR\selftest.h265 (default: the current folder), printing each frame's size.
 //!   sill-host-windows --list
 //!       the window list, the installed apps and the HEVC encoders, then exits.
+//!   sill-host-windows --encoder-check [WxH] [--fps N] [--mbps N] [--times N]
+//!       the check that brings a stream back from the software encoder: the hardware encoder's
+//!       rate at that size (default: the primary display's), N times (default 3), then exits.
 //!   sill-host-windows [--port=N] [--loopback] [--name=NAME] [--no-advertise] [--bitrate=MBPS] …
 //!       the host itself: sill-host-core's server with this backend (HostOptions::USAGE).
 
@@ -24,6 +27,7 @@ fn main() {
     let code = match args.first().map(String::as_str) {
         Some("--selftest") => selftest::run(&args[1..]),
         Some("--list") => selftest::list(),
+        Some("--encoder-check") => selftest::encoder_check(&args[1..]),
         Some("--help") | Some("-h") => {
             println!("{USAGE}\nhost options:\n{}", sill_host_core::HostOptions::USAGE);
             0
@@ -34,7 +38,8 @@ fn main() {
 }
 
 #[cfg(windows)]
-const USAGE: &str = "usage: sill-host-windows [host options] | --selftest [--frames N] [--window ID] [--out DIR] | --list";
+const USAGE: &str =
+    "usage: sill-host-windows [host options] | --selftest [--frames N] [--window ID] [--out DIR] | --list | --encoder-check [WxH] [--fps N] [--mbps N] [--times N]";
 
 /// The host: sill-host-core's server (the home door, sessions, the catalog, pacing) with this
 /// backend (NOTES-core.md, "How a backend uses the core"). Blocks until Ctrl-C.

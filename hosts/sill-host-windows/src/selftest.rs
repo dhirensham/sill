@@ -45,6 +45,67 @@ fn print_encoders() {
     }
 }
 
+/// `--encoder-check [WxH] [--fps N] [--mbps N] [--times N]`: the check behind the way back from
+/// the software encoder (win/probe.rs), on its own: the hardware encoder's rate at that size
+/// (default: the primary display's), and whether it would pass `encoderhealth::return_bar`.
+pub fn encoder_check(args: &[String]) -> i32 {
+    use crate::encoderhealth::{self, Check};
+    win::init_process(); // physical pixels: the display's real size
+    let (mut width, mut height) = win::stream::monitor_rect(win::stream::primary_monitor())
+        .map(|r| ((r.right - r.left) as u32, (r.bottom - r.top) as u32))
+        .unwrap_or((1920, 1080));
+    let (mut fps, mut mbps, mut times) = (60u32, 40u32, 3u32);
+    let mut i = 0;
+    while i < args.len() {
+        let value = args.get(i + 1);
+        match (args[i].as_str(), value) {
+            ("--fps", Some(v)) => fps = v.parse().unwrap_or(fps),
+            ("--mbps", Some(v)) => mbps = v.parse().unwrap_or(mbps),
+            ("--times", Some(v)) => times = v.parse().unwrap_or(times),
+            (size, _) if size.contains('x') => {
+                let mut parts = size.split('x').map(|p| p.parse::<u32>());
+                match (parts.next(), parts.next()) {
+                    (Some(Ok(w)), Some(Ok(h))) => (width, height) = (w, h),
+                    _ => {
+                        eprintln!("encoder-check: {size} is not a size (WxH)");
+                        return 2;
+                    }
+                }
+                i += 1;
+                continue;
+            }
+            (other, _) => {
+                eprintln!("encoder-check: unknown argument {other}");
+                return 2;
+            }
+        }
+        i += 2;
+    }
+    let pixels = width as u64 * height as u64;
+    let mut engine = encoderhealth::ASSUMED_ENGINE_PIXEL_RATE;
+    println!("Hardware encoder check at {width}×{height}, {fps} fps, {mbps} Mbps:");
+    for n in 1..=times.max(1) {
+        let needed = encoderhealth::return_bar(fps, pixels, engine);
+        let started = Instant::now();
+        let check = win::probe::throughput(None, width, height, fps, mbps * 1_000_000);
+        let took = started.elapsed().as_millis();
+        match &check {
+            Check::Answered(Some(rate)) => {
+                engine = engine.max(rate * pixels as f64);
+                println!(
+                    "  {n}: {rate:.1} fps ({:.0} MP/s) in {took} ms; a return needs {needed:.1}: {}",
+                    rate * pixels as f64 / 1e6,
+                    if *rate >= needed { "back" } else { "busy" }
+                );
+            }
+            Check::Answered(None) => println!("  {n}: answered, too few frames to time, in {took} ms: back"),
+            Check::NoAnswer(after) => println!("  {n}: no answer after {} ms", after.as_millis()),
+            Check::Refused(why) => println!("  {n}: would not start: {why}"),
+        }
+    }
+    0
+}
+
 /// Collects what a stream delivers.
 struct Collector {
     file: Mutex<std::fs::File>,

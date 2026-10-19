@@ -12,7 +12,7 @@ use windows::Win32::Graphics::Direct3D::{
     D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
 };
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread, ID3D11Texture2D,
+    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread, ID3D11Texture2D, D3D11_SUBRESOURCE_DATA,
     D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_BIND_VIDEO_ENCODER, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
     D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
     D3D11_USAGE_STAGING,
@@ -90,7 +90,28 @@ impl D3d {
         self.texture_bound(width, height, format, bind)
     }
 
+    /// An NV12 texture holding `bytes` (the Y plane, then the interleaved UV plane, rows `width`
+    /// bytes apart), marked for the video encoder where the driver allows it: a test pattern for
+    /// the hardware encoder's check (win/probe.rs).
+    pub fn nv12_with(&self, width: u32, height: u32, bytes: &[u8]) -> windows::core::Result<ID3D11Texture2D> {
+        let data = D3D11_SUBRESOURCE_DATA { pSysMem: bytes.as_ptr() as *const _, SysMemPitch: width, SysMemSlicePitch: 0 };
+        let encoder = (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_VIDEO_ENCODER.0) as u32;
+        self.texture_bound_with(width, height, DXGI_FORMAT_NV12, encoder, Some(&data))
+            .or_else(|_| self.texture_bound_with(width, height, DXGI_FORMAT_NV12, D3D11_BIND_RENDER_TARGET.0 as u32, Some(&data)))
+    }
+
     fn texture_bound(&self, width: u32, height: u32, format: DXGI_FORMAT, bind: u32) -> windows::core::Result<ID3D11Texture2D> {
+        self.texture_bound_with(width, height, format, bind, None)
+    }
+
+    fn texture_bound_with(
+        &self,
+        width: u32,
+        height: u32,
+        format: DXGI_FORMAT,
+        bind: u32,
+        data: Option<&D3D11_SUBRESOURCE_DATA>,
+    ) -> windows::core::Result<ID3D11Texture2D> {
         let desc = D3D11_TEXTURE2D_DESC {
             Width: width,
             Height: height,
@@ -104,7 +125,7 @@ impl D3d {
             MiscFlags: 0,
         };
         let mut tex = None;
-        unsafe { self.device.CreateTexture2D(&desc, None, Some(&mut tex))? };
+        unsafe { self.device.CreateTexture2D(&desc, data.map(|d| d as *const _), Some(&mut tex))? };
         tex.ok_or_else(windows::core::Error::empty)
     }
 

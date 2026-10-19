@@ -103,6 +103,21 @@ fn enumerate(flags: MFT_ENUM_FLAG, hardware: bool) -> Vec<Candidate> {
     out
 }
 
+/// A new activation object for the encoder `candidate` names (the same kind, name and GPU), from a
+/// listing made now; None when it is no longer listed (the caller then uses the candidate's own).
+fn activation(candidate: &Candidate) -> Option<Shared<IMFActivate>> {
+    let flags = if candidate.hardware {
+        MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER
+    } else {
+        MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_ASYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER
+    };
+    let same_adapter = |a: Option<LUID>| a.map(|l| (l.LowPart, l.HighPart)) == candidate.adapter.map(|l| (l.LowPart, l.HighPart));
+    enumerate(flags, candidate.hardware)
+        .into_iter()
+        .find(|c| c.name == candidate.name && same_adapter(c.adapter))
+        .map(|c| c.activate)
+}
+
 fn attribute_string(attrs: &IMFAttributes, key: &GUID) -> Option<String> {
     unsafe {
         let mut p = PWSTR::null();
@@ -181,10 +196,15 @@ impl Encoder {
         startup()?;
         let fail = |what: &str, e: windows::core::Error| format!("{} ({}): {what}: {e}", candidate.name, kind(candidate));
         unsafe {
-            let mft: IMFTransform = candidate.activate.ActivateObject().map_err(|e| fail("activate", e))?;
-            // The activation object caches what it made: detached, the next ActivateObject (a new
-            // size, a retry) makes a fresh MFT instead of returning this one after its shutdown.
-            let _ = candidate.activate.DetachObject();
+            // A new activation object for every encoder: one makes its MFT once. Asked again
+            // after its first MFT was shut down (a new size, the way back from the software
+            // encoder), Intel's crashed the process, even with the object detached (an XPS 13,
+            // 2026-10-19); a fresh one from the same listing never did.
+            let fresh = activation(candidate);
+            let activate = fresh.as_ref().unwrap_or(&candidate.activate);
+            let mft: IMFTransform = activate.ActivateObject().map_err(|e| fail("activate", e))?;
+            // Detached, the object holds nothing of the MFT, which our own Shutdown ends.
+            let _ = activate.DetachObject();
             let attrs = mft.GetAttributes().ok();
             let is_async = attrs.as_ref().and_then(|a| a.GetUINT32(&MF_TRANSFORM_ASYNC).ok()).unwrap_or(0) != 0;
             if is_async {
@@ -295,6 +315,14 @@ impl Encoder {
 
     pub fn error(&self) -> Option<String> {
         self.inner.state.lock().ok()?.error.clone()
+    }
+
+    /// Given up on (it hung): nothing it still returns reaches the stream, whose next encoder's
+    /// keyframe may already be on its way to the devices (an old delta after it would show as a
+    /// broken picture until the next keyframe). Its teardown, which a hung driver can block, is
+    /// the caller's to put on another thread.
+    pub fn retire(&self) {
+        self.inner.stopping.store(true, Ordering::SeqCst);
     }
 
     /// Encodes one NV12 frame (a GPU texture for a D3D-aware encoder, else its bytes), at
@@ -543,8 +571,11 @@ fn event_loop(inner: Arc<Inner>) {
                 Ok(mut st) => output_once(&inner, &mut st, &mut ready).map(|_| ()),
                 Err(_) => Err("encoder state poisoned".into()),
             };
-            for frame in ready {
-                (inner.deliver)(frame);
+            // A retired encoder's late frames go nowhere (`retire`).
+            if !inner.stopping.load(Ordering::SeqCst) {
+                for frame in ready {
+                    (inner.deliver)(frame);
+                }
             }
             if let Err(e) = result {
                 fail(&inner, e);

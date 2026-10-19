@@ -11,6 +11,7 @@
 
 pub mod annexb;
 pub mod applog;
+pub mod encoderhealth;
 pub mod fwpolicy;
 pub mod glyph;
 pub mod imaging;

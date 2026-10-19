@@ -14,6 +14,7 @@ pub mod input;
 pub mod login;
 pub mod logwindow;
 pub mod pairui;
+pub mod probe;
 pub mod stream;
 pub mod theme;
 pub mod tray;

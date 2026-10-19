@@ -11,10 +11,17 @@
 //! source is still (no new frame for 50 ms) the last picture is encoded again so the keyframe
 //! goes out anyway. A window that changes size gets a new converter and encoder at its new size
 //! once the size holds still for 150 ms (until then the old size is kept, scaled). A hardware
-//! encoder that fails or holds a frame for 1.5 s is replaced by the software one once.
+//! encoder that fails or holds a frame for 1.5 s is replaced by the software one, at half scale and
+//! 60 fps at most, and the hardware is checked now and then on a thread of its own until it keeps
+//! up again (encoderhealth.rs, probe.rs); every stream starts on the software encoder meanwhile.
+//!
+//! TEST ONLY: SILL_TEST_ENCODER_HANG=N makes the first N hardware encoders take no frame after
+//! their 90th (a busy encoder, without touching it); SILL_TEST_RECHECK_SECONDS=N waits N to 10 N
+//! seconds between checks instead of 30 to 300.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -31,7 +38,9 @@ use super::convert::Converter;
 use super::cursor::CursorWatcher;
 use super::d3d::D3d;
 use super::encoder::{self, Candidate, Encoder, Settings};
+use super::probe;
 use super::util::{com_init, log};
+use crate::encoderhealth::{self, Check, Health, Verdict};
 use crate::sizing;
 
 const STILL_AFTER: Duration = Duration::from_millis(50);
@@ -40,6 +49,77 @@ const HANG_AFTER: Duration = Duration::from_millis(1500);
 const NUDGE_AFTER: Duration = Duration::from_millis(100);
 /// NV12 surfaces the converter writes in turn: more than can be inside the encoder at once.
 const SURFACES: usize = 6;
+/// The frame after which SILL_TEST_ENCODER_HANG's encoders take no more.
+const TEST_HANG_AT: u64 = 90;
+
+/// The host's hardware encoder as every stream sees it (encoderhealth.rs).
+fn health() -> MutexGuard<'static, Health> {
+    static HEALTH: OnceLock<Mutex<Health>> = OnceLock::new();
+    HEALTH
+        .get_or_init(|| {
+            let test = std::env::var("SILL_TEST_RECHECK_SECONDS").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|n| *n > 0);
+            let health = match test {
+                Some(n) => {
+                    log(&format!("TEST: hardware encoder checks {n} to {} s apart (SILL_TEST_RECHECK_SECONDS)", n * 10));
+                    Health::new(Duration::from_secs(n), Duration::from_secs(n * 10))
+                }
+                None => Health::default(),
+            };
+            Mutex::new(health)
+        })
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// A check of the hardware is running (one at a time for the process: two would share the encoder).
+static CHECKING: AtomicBool = AtomicBool::new(false);
+
+/// SILL_TEST_ENCODER_HANG: true for each of the first N hardware encoders that reach their 90th frame.
+fn take_test_hang() -> bool {
+    static LEFT: OnceLock<AtomicU32> = OnceLock::new();
+    let left = LEFT.get_or_init(|| {
+        let n = std::env::var("SILL_TEST_ENCODER_HANG").ok().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(0);
+        if n > 0 {
+            log(&format!("TEST: the first {n} hardware encoders take no frame after their {TEST_HANG_AT}th (SILL_TEST_ENCODER_HANG)"));
+        }
+        AtomicU32::new(n)
+    });
+    let mut n = left.load(Ordering::SeqCst);
+    while n > 0 {
+        match left.compare_exchange(n, n - 1, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return true,
+            Err(now) => n = now,
+        }
+    }
+    false
+}
+
+/// A check of the hardware running for this stream: its answer, and the size it checked.
+struct PendingCheck {
+    answer: Receiver<Check>,
+    size: (u32, u32),
+}
+
+/// Starts a check of the hardware at `size` on its own thread, unless one is running already.
+fn start_check(shared: &Arc<Shared>, adapter: windows::Win32::Foundation::LUID, size: (u32, u32), config: &StreamConfig) -> Option<PendingCheck> {
+    if CHECKING.swap(true, Ordering::SeqCst) {
+        return None;
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let waker = shared.clone();
+    let (fps, bitrate) = (config.fps, config.bitrate);
+    let spawned = std::thread::Builder::new().name("sill-encoder-check".into()).spawn(move || {
+        let check = probe::throughput(Some(adapter), size.0, size.1, fps, bitrate);
+        let _ = tx.send(check);
+        CHECKING.store(false, Ordering::SeqCst);
+        waker.notify();
+    });
+    if spawned.is_err() {
+        CHECKING.store(false, Ordering::SeqCst);
+        return None;
+    }
+    Some(PendingCheck { answer: rx, size })
+}
 
 /// What a stream captures, for its rectangle.
 #[derive(Clone, Copy)]
@@ -215,9 +295,28 @@ struct Chain {
     encoder: Encoder,
     input: (u32, u32),
     output: (u32, u32),
+    /// The encoder's frame rate (the software fallback's is 60 at most).
+    fps: u32,
     next: usize,
 }
 
+/// The encoder's settings for a captured size: the stream's own, or the software fallback's (half
+/// the scale, 60 fps at most: at 3840×2400 the software encoder gave 2–5 fps).
+fn settings_for(input: (u32, u32), config: &StreamConfig, fallback: bool) -> Settings {
+    let scale = if fallback { config.scale * encoderhealth::SOFTWARE_SCALE } else { config.scale };
+    let output = sizing::output_size(input.0, input.1, scale);
+    let fps = config.fps.max(1);
+    Settings {
+        width: output.0,
+        height: output.1,
+        fps: if fallback { encoderhealth::software_fps(fps) } else { fps },
+        bitrate: config.bitrate.max(100_000),
+        prioritize_speed: config.prioritize_speed,
+    }
+}
+
+/// A chain for `input`: the hardware encoder at the stream's settings, else (none starts, or
+/// `software_only`) the software one; after a hardware failure (`software_only`) at the fallback's.
 fn build_chain(
     d3d: &D3d,
     candidates: &[Candidate],
@@ -226,25 +325,45 @@ fn build_chain(
     config: &StreamConfig,
     shared: &Arc<Shared>,
 ) -> Result<Chain, String> {
-    let output = sizing::output_size(input.0, input.1, config.scale);
-    let settings = Settings {
-        width: output.0,
-        height: output.1,
-        fps: config.fps.max(1),
-        bitrate: config.bitrate.max(100_000),
-        prioritize_speed: config.prioritize_speed,
-    };
+    let mut errors = Vec::new();
+    if !software_only {
+        let hardware: Vec<&Candidate> = candidates.iter().filter(|c| c.hardware).collect();
+        if let Some(chain) = chain_with(d3d, &hardware, input, settings_for(input, config, false), shared, &mut errors)? {
+            return Ok(chain);
+        }
+    }
+    let software: Vec<&Candidate> = candidates.iter().filter(|c| !c.hardware).collect();
+    if let Some(chain) = chain_with(d3d, &software, input, settings_for(input, config, software_only), shared, &mut errors)? {
+        return Ok(chain);
+    }
+    if candidates.is_empty() || (software_only && !candidates.iter().any(|c| !c.hardware)) {
+        Err(encoder::NO_ENCODER.to_string())
+    } else {
+        Err(format!("no HEVC encoder would start: {}", errors.join("; ")))
+    }
+}
+
+/// The converter, its surfaces and the first of `candidates` that starts, at `settings`; None when
+/// none starts (each one's reason in `errors`).
+fn chain_with(
+    d3d: &D3d,
+    candidates: &[&Candidate],
+    input: (u32, u32),
+    settings: Settings,
+    shared: &Arc<Shared>,
+    errors: &mut Vec<String>,
+) -> Result<Option<Chain>, String> {
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    let output = (settings.width, settings.height);
     let surfaces = (0..SURFACES)
         .map(|_| d3d.texture(output.0, output.1, DXGI_FORMAT_NV12))
         .collect::<windows::core::Result<Vec<_>>>()
         .map_err(|e| format!("NV12 surfaces {}×{}: {e}", output.0, output.1))?;
     let converter = Converter::new(d3d, input.0, input.1, output.0, output.1, settings.fps, &surfaces)
         .map_err(|e| format!("video processor {}×{} → {}×{}: {e}", input.0, input.1, output.0, output.1))?;
-    let mut errors = Vec::new();
-    for candidate in candidates {
-        if software_only && candidate.hardware {
-            continue;
-        }
+    for candidate in candidates.iter().copied() {
         if candidate.hardware && candidate.adapter.is_some_and(|a| a != d3d.adapter) {
             errors.push(format!("{} is on another GPU", candidate.name));
             continue;
@@ -270,7 +389,7 @@ fn build_chain(
                     settings.fps,
                     settings.bitrate / 1_000_000
                 ));
-                return Ok(Chain { converter, surfaces, staging, encoder, input, output, next: 0 });
+                return Ok(Some(Chain { converter, surfaces, staging, encoder, input, output, fps: settings.fps, next: 0 }));
             }
             Err(e) => {
                 log(&format!("Encoder refused: {e}"));
@@ -278,11 +397,7 @@ fn build_chain(
             }
         }
     }
-    if candidates.is_empty() || (software_only && !candidates.iter().any(|c| !c.hardware)) {
-        Err(encoder::NO_ENCODER.to_string())
-    } else {
-        Err(format!("no HEVC encoder would start: {}", errors.join("; ")))
-    }
+    Ok(None)
 }
 
 /// Our copy of the newest frame (the capture's buffers go back to it at once).
@@ -337,7 +452,14 @@ fn pipeline(shared: &Arc<Shared>, config: &StreamConfig, target: Target, ready: 
     .map_err(|e| format!("capture: {e}"))?;
     let size = capture.item_size().ok_or("the capture has no size")?;
     let initial = (size.Width.max(1) as u32, size.Height.max(1) as u32);
-    let mut software_only = false;
+    // A hardware encoder that failed in an earlier stream has to pass a check first.
+    let (mut software_only, until_check) = {
+        let h = health();
+        (h.software(), h.until_check(Instant::now()))
+    };
+    if software_only && candidates.iter().any(|c| c.hardware) {
+        log(&encoderhealth::starts_on_software_line(until_check));
+    }
     let mut chain = build_chain(&d3d, &candidates, software_only, initial, config, shared)?;
     if let Some(tx) = ready.take() {
         let _ = tx.send(Ok(()));
@@ -345,7 +467,6 @@ fn pipeline(shared: &Arc<Shared>, config: &StreamConfig, target: Target, ready: 
     log(&format!("Stream started: {:?}, {}×{} captured", config.source, initial.0, initial.1));
 
     let start = Instant::now();
-    let interval = Duration::from_secs_f64(1.0 / fps as f64);
     let mut latest: Option<Latest> = None;
     let mut fresh = false;
     let mut last_frame_at = Instant::now();
@@ -355,13 +476,18 @@ fn pipeline(shared: &Arc<Shared>, config: &StreamConfig, target: Target, ready: 
     let mut seen = 0u64;
     let mut nudged = false;
     let mut blocked_since: Option<Instant> = None;
+    // Frames into this chain's encoder, and SILL_TEST_ENCODER_HANG's hold on it.
+    let mut chain_frames = 0u64;
+    let mut test_hang_since: Option<Instant> = None;
+    let mut pending_check: Option<PendingCheck> = None;
 
     while !shared.stop.load(Ordering::SeqCst) {
         if shared.closed.load(Ordering::SeqCst) {
             return Err("The window closed.".into());
         }
-        // A failed or hung hardware encoder: the software one, once. Hung: full with nothing back
-        // for 1.5 s, or new frames kept out for 1.5 s by an encoder that never asks for input.
+        // A failed or hung hardware encoder: the software one, until a check finds the hardware
+        // keeping up (below). Hung: full with nothing back for 1.5 s, or new frames kept out for
+        // 1.5 s by an encoder that never asks for input.
         let failure = chain
             .encoder
             .error()
@@ -373,23 +499,67 @@ fn pipeline(shared: &Arc<Shared>, config: &StreamConfig, target: Target, ready: 
                     .map(|d| format!("nothing came back for {} ms", d.as_millis()))
             })
             .or_else(|| {
+                test_hang_since
+                    .filter(|t| t.elapsed() > HANG_AFTER)
+                    .map(|t| format!("nothing came back for {} ms", t.elapsed().as_millis()))
+            })
+            .or_else(|| {
                 blocked_since
                     .filter(|t| t.elapsed() > HANG_AFTER)
                     .map(|t| format!("it took no frame for {} ms", t.elapsed().as_millis()))
             });
         if let Some(why) = failure {
             if chain.encoder.hardware && !software_only {
-                log(&format!("Hardware encoder {} failed ({why}); switching to the software encoder", chain.encoder.name));
+                let next = health().fell_back(Instant::now());
+                log(&encoderhealth::fallback_line(&chain.encoder.name, &why, next));
                 software_only = true;
-                blocked_since = None;
-                let input = chain.input;
-                // A hung driver can block its own teardown: that happens off this thread.
-                let Chain { encoder: hung, .. } = chain;
-                let _ = std::thread::Builder::new().name("sill-encoder-teardown".into()).spawn(move || drop(hung));
-                chain = build_chain(&d3d, &candidates, true, input, config, shared)?;
-                shared.keyframe.store(true, Ordering::SeqCst);
+                chain = replace_chain(chain, &d3d, &candidates, true, config, shared)?;
+                (blocked_since, test_hang_since, chain_frames) = (None, None, 0);
             } else {
                 return Err(format!("the encoder failed: {why}"));
+            }
+        }
+
+        // On the software encoder: the hardware checked when it is due, and back on it once it
+        // keeps up (or once another stream's check found it so).
+        if software_only {
+            let mut back = false;
+            if let Some(pending) = &pending_check {
+                match pending.answer.try_recv() {
+                    Ok(check) => {
+                        let verdict = health().judge(Instant::now(), &check, pending.size, config.fps);
+                        match verdict {
+                            Verdict::Back(line) => {
+                                log(&line);
+                                back = true;
+                            }
+                            Verdict::Stay { line, .. } => log(&line),
+                        }
+                        pending_check = None;
+                    }
+                    Err(TryRecvError::Disconnected) => pending_check = None,
+                    Err(TryRecvError::Empty) => {}
+                }
+            } else if !health().software() {
+                back = true;
+            } else if health().check_due(Instant::now()) {
+                let size = sizing::output_size(chain.input.0, chain.input.1, config.scale);
+                pending_check = start_check(shared, d3d.adapter, size, config);
+            }
+            if back {
+                software_only = false;
+                chain = replace_chain(chain, &d3d, &candidates, false, config, shared)?;
+                (blocked_since, test_hang_since, chain_frames) = (None, None, 0);
+                if !chain.encoder.hardware {
+                    // Back, but no hardware encoder would start: the software one at half scale again.
+                    let next = health().fell_back(Instant::now());
+                    log(&format!(
+                        "No hardware encoder would start; back to the software encoder at half scale (next check in {} s)",
+                        next.as_secs()
+                    ));
+                    software_only = true;
+                    chain = replace_chain(chain, &d3d, &candidates, true, config, shared)?;
+                }
             }
         }
 
@@ -429,12 +599,14 @@ fn pipeline(shared: &Arc<Shared>, config: &StreamConfig, target: Target, ready: 
                 chain = build_chain(&d3d, &candidates, software_only, size, config, shared)?;
                 shared.keyframe.store(true, Ordering::SeqCst);
                 pending_size = None;
+                (blocked_since, test_hang_since, chain_frames) = (None, None, 0);
                 log(&format!("Source resized: {}×{} captured, {}×{} encoded", size.0, size.1, chain.output.0, chain.output.1));
             }
         }
 
         // Into the encoder: a fresh frame when the encoder has room and the frame rate allows,
         // or the last picture again for a keyframe the still source would never carry.
+        let interval = Duration::from_secs_f64(1.0 / chain.fps.max(1) as f64);
         let paced = last_submit.is_none_or(|t| t.elapsed() >= interval.mul_f64(0.9));
         let keyframe_wanted = shared.keyframe.load(Ordering::SeqCst);
         let still = last_frame_at.elapsed() >= STILL_AFTER;
@@ -445,7 +617,7 @@ fn pipeline(shared: &Arc<Shared>, config: &StreamConfig, target: Target, ready: 
             && chain.encoder.stalled_for().is_some_and(|d| d > NUDGE_AFTER);
         if let Some(l) = &latest {
             let wanted = fresh || (keyframe_wanted && still) || nudge;
-            if wanted && paced {
+            if wanted && paced && test_hang_since.is_none() {
                 if chain.encoder.accepts() {
                     let keyframe = shared.keyframe.swap(false, Ordering::SeqCst);
                     let now = start.elapsed().as_nanos() as i64 / 100;
@@ -455,6 +627,11 @@ fn pipeline(shared: &Arc<Shared>, config: &StreamConfig, target: Target, ready: 
                     fresh = false;
                     blocked_since = None;
                     last_submit = Some(Instant::now());
+                    chain_frames += 1;
+                    if chain.encoder.hardware && chain_frames == TEST_HANG_AT && take_test_hang() {
+                        log(&format!("TEST: {} takes no frame after this one (SILL_TEST_ENCODER_HANG)", chain.encoder.name));
+                        test_hang_since = Some(Instant::now());
+                    }
                 } else if chain.encoder.stalled_for().is_none() {
                     // Nothing inside and still no room: the encoder is not asking for input.
                     blocked_since.get_or_insert_with(Instant::now);
@@ -476,12 +653,37 @@ fn pipeline(shared: &Arc<Shared>, config: &StreamConfig, target: Target, ready: 
         if let Some((_, since)) = pending_size {
             timeout = timeout.min(RESIZE_SETTLE.saturating_sub(since.elapsed()).max(Duration::from_millis(1)));
         }
-        if chain.encoder.stalled_for().is_some() || blocked_since.is_some() {
+        if chain.encoder.stalled_for().is_some() || blocked_since.is_some() || test_hang_since.is_some() {
             timeout = timeout.min(Duration::from_millis(100));
         }
         shared.wait(&mut seen, timeout);
     }
     Ok(())
+}
+
+/// Puts `old` aside and builds a chain for the same captured size (`build_chain`); the next frame
+/// is a keyframe. The old encoder is retired, so nothing it still returns reaches the devices, and
+/// torn down on another thread: a hung driver can block its teardown.
+fn replace_chain(
+    old: Chain,
+    d3d: &D3d,
+    candidates: &[Candidate],
+    software_only: bool,
+    config: &StreamConfig,
+    shared: &Arc<Shared>,
+) -> Result<Chain, String> {
+    let input = old.input;
+    let Chain { encoder: retired, .. } = old;
+    retired.retire();
+    // In COM, as every thread that touches an encoder: Microsoft's software MFT torn down from a
+    // thread outside it crashed the process (an access violation, on the way back to the hardware).
+    let _ = std::thread::Builder::new().name("sill-encoder-teardown".into()).spawn(move || {
+        com_init();
+        drop(retired);
+    });
+    let chain = build_chain(d3d, candidates, software_only, input, config, shared)?;
+    shared.keyframe.store(true, Ordering::SeqCst);
+    Ok(chain)
 }
 
 /// The content size, never past the texture (a frame can arrive before the pool is recreated).

@@ -20,6 +20,7 @@ mod annexb;
 mod imaging;
 mod keymap;
 mod keys;
+mod pairview;
 mod pointer;
 mod sizing;
 

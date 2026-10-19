@@ -8,6 +8,7 @@
 //! agent's job alone: a backend that needs more writes it down in its NOTES file instead.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 /// A rectangle in the platform's global desktop coordinates, in its logical units (Windows: physical
 /// pixels of the virtual screen; X11: pixels of the root window).
@@ -155,6 +156,38 @@ pub enum WindowCommand {
     FullScreen,
 }
 
+/// How the host's pairing window changed (`--pairing`, `--remote`), for a backend with a window of
+/// its own, as Sill.app's "Pair iPhone or iPad" (PairDeviceWindow.swift). The core keeps at most one
+/// code open at a time and prints every change on the console too.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PairingEvent {
+    /// A code is up: its 12 digits, the `sill://pair` link its QR code holds, how long it works,
+    /// the device whose ask opened it (that device scans or types it), how many devices are paired
+    /// already (a UI may show itself at the first code when none is), and the name devices list
+    /// this host by ("tap ‹host›").
+    Code { code: String, link: String, expires_in: Duration, asked_by: Option<String>, paired: usize, host: String },
+    /// A device asked to pair while a code was already up.
+    Asked { device: String },
+    /// A device that asked no longer needs its code (it cancelled on its side); a fresh code follows.
+    Withdrawn { device: String },
+    WrongCode { device: String, tries_left: u32 },
+    Paired { device: String },
+    /// Five wrong codes: no code works until a new one (`PairingControl::new_code`) or an ask.
+    Stopped,
+    /// The code showing was cancelled on this host (`PairingControl::cancel`): none works until a
+    /// new one or an ask.
+    Cancelled,
+}
+
+/// What a pairing window may do with its buttons. Never blocks for long.
+pub trait PairingControl: Send + Sync {
+    /// A fresh code in place of the one showing (or of none, after Stopped or Cancelled).
+    fn new_code(&self);
+    /// "Didn't ask for this?": the code showing stops working, and a device whose ask opened it is
+    /// kept quiet for 10 minutes (the Mac's Cancel). No code works until a new one or an ask.
+    fn cancel(&self);
+}
+
 /// Everything the core needs from the operating system. One per process, shared across threads.
 pub trait Platform: Send + Sync + 'static {
     /// The machine's name as devices list it ("Alex's PC", the hostname).
@@ -203,4 +236,10 @@ pub trait Platform: Send + Sync + 'static {
     /// Advertises the host on the local network as `_sill._tcp` (`instance` is the machine name,
     /// `port` the home door's, `txt` the record's keys: `r`, `p`), until the returned guard drops.
     fn advertise(&self, instance: &str, port: u16, txt: &[(String, String)]) -> Result<Box<dyn Send>, String>;
+
+    /// The pairing window changed (`--pairing` or `--remote` only): show it in the host's own UI if
+    /// it has one; `control` is what its buttons call. Called from the core's threads, never while
+    /// the core holds a lock: hand it to the UI's own thread and return. Default: nothing (the
+    /// console has every code). (Added 2026-10-19, additive.)
+    fn pairing_changed(&self, _event: PairingEvent, _control: Arc<dyn PairingControl>) {}
 }

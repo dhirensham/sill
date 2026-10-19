@@ -26,6 +26,20 @@ const ADMISSION_DEADLINE: Duration = Duration::from_secs(10);
 const FAILURE_WINDOW: Duration = Duration::from_secs(60);
 const FAILURES_FOR_BACKOFF: usize = 5;
 
+/// SILL_DEBUG_DOOR=1: one line per connection as it arrives and as it ends (refusals and silent
+/// endings included), for finding where a device's dial stops. Off by default: the Mac logs
+/// neither.
+fn debug_door() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SILL_DEBUG_DOOR").as_deref() == Ok("1"))
+}
+
+fn debug_log(line: impl FnOnce() -> String) {
+    if debug_door() {
+        log(&format!("Door: {}", line()));
+    }
+}
+
 #[derive(Default)]
 struct State {
     pending: HashMap<IpAddr, usize>,
@@ -73,8 +87,8 @@ impl Drop for Slot<'_> {
 }
 
 enum Outcome {
-    /// Nothing to count: the peer went away by itself.
-    Gone,
+    /// Nothing to count: the peer went away by itself (why, for SILL_DEBUG_DOOR).
+    Gone(&'static str),
     Refused(&'static str),
     Admitted,
 }
@@ -175,7 +189,9 @@ impl Door {
                 Origin::Direct => false,
             },
         };
+        debug_log(|| format!("{peer} connected ({origin:?})"));
         if !admitted {
+            debug_log(|| format!("{peer} refused: this door does not admit {origin:?}"));
             self.count(if origin == Origin::Vpn { "vpn" } else { "internet" });
             self.count_failure(source);
             return;
@@ -184,12 +200,14 @@ impl Door {
             let mut st = self.state.lock().unwrap();
             if let Some(until) = st.backoff_until.get(&source) {
                 if Instant::now() < *until {
+                    debug_log(|| format!("{peer} refused: backing off after repeated failures"));
                     st.refusals.entry("limit").and_modify(|n| *n += 1).or_insert(1);
                     return;
                 }
             }
             let from_source = st.pending.get(&source).copied().unwrap_or(0);
             if st.total >= MAX_PENDING || from_source >= MAX_PENDING_PER_SOURCE {
+                debug_log(|| format!("{peer} refused: too many pending ({from_source} from it, {} in all)", st.total));
                 st.refusals.entry("limit").and_modify(|n| *n += 1).or_insert(1);
                 return;
             }
@@ -203,14 +221,18 @@ impl Door {
                 std::net::SocketAddr::V6(v6) if v6.scope_id() != 0 && source.is_ipv6() => format!("{}%{}", source, v6.scope_id()),
                 _ => source.to_string(),
             };
+            let started = Instant::now();
             let outcome = door.admit(stream, source, display, origin);
             drop(slot);
+            let ms = started.elapsed().as_millis();
             match outcome {
                 Outcome::Refused(word) => {
+                    debug_log(|| format!("{peer} refused ({word}) after {ms} ms"));
                     door.count(word);
                     door.count_failure(source);
                 }
-                Outcome::Gone | Outcome::Admitted => {}
+                Outcome::Gone(why) => debug_log(|| format!("{peer} gone after {ms} ms: {why}")),
+                Outcome::Admitted => debug_log(|| format!("{peer} admitted after {ms} ms")),
             }
         });
     }
@@ -225,9 +247,12 @@ impl Door {
         let mut first_byte_checked = false;
         let accepted = loop {
             match acceptor.read_tls(&mut tcp) {
-                Ok(0) => return Outcome::Gone,
+                Ok(0) => return Outcome::Gone("closed before its ClientHello"),
                 Ok(_) => {}
-                Err(_) => return Outcome::Refused("unpaired"),
+                Err(e) => {
+                    debug_log(|| format!("{display}: reading the ClientHello: {e}"));
+                    return Outcome::Refused("unpaired");
+                }
             }
             match acceptor.accept() {
                 Ok(Some(a)) => break a,
@@ -245,6 +270,10 @@ impl Door {
         };
         let offered: Vec<Vec<u8>> = accepted.client_hello().alpn().map(|i| i.map(|p| p.to_vec()).collect()).unwrap_or_default();
         let alpn = chosen_alpn(&offered);
+        debug_log(|| {
+            let names: Vec<String> = offered.iter().map(|p| String::from_utf8_lossy(p).into_owned()).collect();
+            format!("{display}: ClientHello offers ALPN {names:?}, chose {alpn:?}")
+        });
         let pairing = self.pairing.clone();
         let remote = self.kind != DoorKind::Home;
         // DoorPolicy.trusts: a session for a paired key at either door; pairing at home always,
@@ -261,12 +290,13 @@ impl Door {
             Ok(c) => c,
             Err(e) => {
                 log(&format!("Home door: TLS could not start ({e})."));
-                return Outcome::Gone;
+                return Outcome::Gone("TLS could not start");
             }
         };
         let mut conn = match accepted.into_connection(config) {
             Ok(c) => c,
-            Err((_, mut alert)) => {
+            Err((e, mut alert)) => {
+                debug_log(|| format!("{display}: TLS refused the ClientHello: {e}"));
                 let _ = alert.write_all(&mut tcp);
                 return Outcome::Refused("unpaired");
             }
@@ -276,10 +306,16 @@ impl Door {
             if let Err(e) = conn.complete_io(&mut tcp) {
                 // The verify block refused the key (an alert went out), the pin did not match on
                 // the device's side, or the deadline passed.
+                debug_log(|| format!("{display}: TLS handshake ended: {e} ({:?})", e.kind()));
                 let _ = conn.complete_io(&mut tcp);
-                return if e.kind() == std::io::ErrorKind::UnexpectedEof { Outcome::Gone } else { Outcome::Refused("unpaired") };
+                return if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                    Outcome::Gone("closed during the TLS handshake")
+                } else {
+                    Outcome::Refused("unpaired")
+                };
             }
         }
+        debug_log(|| format!("{display}: TLS handshake done, ALPN {:?}", conn.alpn_protocol().map(String::from_utf8_lossy)));
         let Some(fp) = conn.peer_certificates().and_then(|c| c.first()).and_then(|c| certificate_fingerprint(c.as_ref())) else {
             return Outcome::Refused("unpaired");
         };
@@ -324,7 +360,7 @@ impl Door {
                         }
                         Outcome::Admitted
                     }
-                    Err(_) => Outcome::Gone,
+                    Err(_) => Outcome::Gone("the session could not start"),
                 }
             }
             Some(a) if a == PAIRING_ALPN.as_bytes() => self.pair(conn, tcp, fp, source, display, origin, deadline),
@@ -352,12 +388,12 @@ impl Door {
             s.read_exact(&mut b).ok()?;
             Some(b)
         };
-        let Some(head) = read(&mut conn, &mut tcp, HEADER_LEN) else { return Outcome::Gone };
+        let Some(head) = read(&mut conn, &mut tcp, HEADER_LEN) else { return Outcome::Gone("closed before its pairing request") };
         let Some(h) = Header::parse(&head) else { return Outcome::Refused("unpaired") };
         if h.kind != Kind::PairRequest || h.payload_len == 0 || h.payload_len as usize > MAX_PAIRING_PAYLOAD {
             return Outcome::Refused("unpaired");
         }
-        let Some(payload) = read(&mut conn, &mut tcp, h.payload_len as usize) else { return Outcome::Gone };
+        let Some(payload) = read(&mut conn, &mut tcp, h.payload_len as usize) else { return Outcome::Gone("closed inside its pairing request") };
         let Some(request) = from_json::<PairRequest>(&payload) else { return Outcome::Refused("unpaired") };
         let from_this_machine = origin == Origin::Loopback;
         let attempt = Attempt {

@@ -16,6 +16,8 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png"]
 
 [target.'cfg(windows)'.dependencies]
 windows-core = "0.62"
+# The pairing window's QR code (MIT; no dependencies).
+qrcodegen = "1.8"
 # Microsoft's Win32 and WinRT bindings (MIT OR Apache-2.0).
 windows = { version = "0.62", features = [
     "Foundation",
@@ -48,6 +50,7 @@ windows = { version = "0.62", features = [
     "Win32_System_WinRT_Direct3D11",
     "Win32_System_WinRT_Graphics_Capture",
     "Win32_UI_HiDpi",
+    "Win32_UI_Controls",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
     "Win32_UI_Shell_Common",

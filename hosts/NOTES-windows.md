@@ -2,6 +2,24 @@
 
 Owner: the Windows agent. Scope: `hosts/sill-host-windows/**` and this file.
 
+## Status (2026-10-19: first run on a PC)
+
+- Run on Windows 11 Pro (build 28120) on an XPS 13 (Intel graphics, 175 % scaling) against the App
+  Store iPad app (Sill 0.5.1 (4)): `--list` (windows front to back, Store apps by AUMID, 212 Start
+  menu apps, the Intel hardware HEVC MFT first; it is listed twice), `--selftest` (3840×2400 Desktop
+  on the Intel MFT, keyframe with VPS/SPS/PPS first, thumbnail and icon right), and `--pairing`:
+  the iPad paired by the typed code over TLS and streamed the Desktop and windows at 47–55 fps,
+  5–7 ms round trips. Frame age read ~90 ms because the PC's clock was ~89 ms behind (Windows Time
+  not syncing); the age is the device's clock minus the host's.
+- The pairing window (below, `pairview.rs`, `win/pairui.rs`), shown at the start when nothing is
+  paired, at a device's ask, and closed 3 s after "Paired". Seen on this PC at 175 %: the start,
+  an ask over the host's code, a wrong code, Paired, Stopped after 5, a device-opened window and its
+  Cancel (the device then refused `openOnMac`), New Code.
+- Found on the way, fixed or worked around: the firewall (Building: a program rule never matches an
+  exe on a Dev Drive or any volume mounted in a folder; use a port rule); the build needs a Visual
+  Studio install whose MSVC has the x64 libraries (here only 2019 Build Tools had them: build inside
+  its `vcvars64.bat`).
+
 ## Status (2026-10-14)
 
 - The whole `Platform` trait is implemented for Windows 10 1903+ and 11, and type-checks and lints
@@ -41,6 +59,8 @@ Owner: the Windows agent. Scope: `hosts/sill-host-windows/**` and this file.
 | `win/stream.rs` | The stream thread: newest WGC frame → copied into our own BGRA texture (the capture buffer goes back at once) → converter → encoder, paced to `fps`, frames dropped never queued. Keyframe requests ride the next frame, or re-encode the last picture once the source has been still 50 ms. A content size that holds for 150 ms rebuilds converter and encoder. A hardware encoder that errors, is full with nothing back for 1.5 s, or keeps new frames out for 1.5 s without asking for input is replaced by the software one, once (the hung one is torn down on a thread of its own, since a wedged driver can block its teardown); then the stream ends with the reason. A still source whose encoder still holds a frame after 100 ms gets the last picture once more, so the last change reaches the devices. `timeBeginPeriod(1)` while streaming (60/120 fps pacing). `source_rect`: the window's frame bounds or the monitor's rect, physical px. |
 | `win/mod.rs` | `WindowsPlatform`; per-monitor-v2 DPI awareness set once at start (so window rects, capture, SendInput and GetCursorPos all speak physical pixels); `release_input()`. |
 | `selftest.rs` | `--selftest` / `--list` (below). |
+| `pairview.rs` (portable) | The pairing window's state and words from the core's `PairingEvent`s (Sill.app's PairDeviceWindow): the host's own code ("tap ‹host›", "Can’t scan? …", New Code, Close), a device's ask over it, a window a device's ask opened ("‹device› on this network asked to pair.", "Didn’t ask for this? Click Cancel."), a wrong code, "Paired with ‹device›." for 3 s then closed, Stopped; when it comes up (at the start only when nothing is paired; an ask brings it up without the keyboard). |
+| `win/pairui.rs` | "Pair iPhone or iPad": one Win32 window on a thread of its own, made at the first pairing event; the core's threads queue events and post a message. STATIC controls for the words (Narrator reads them), the QR code painted with GDI (`qrcodegen`, MIT), the system's buttons (Common Controls v6 through `build.rs`'s embedded manifest, MSVC only), per-monitor DPI. Close only hides it (the host's code keeps working, as the console's); Cancel on a device-opened window is `PairingControl::cancel`. |
 
 ## Building
 
@@ -82,9 +102,27 @@ target\release\sill-host-windows.exe --selftest --frames 300 --out %TEMP%
 target\release\sill-host-windows.exe            # the host; allow it through Windows Firewall
 ```
 
-Devices (Debug builds of the apps, which still dial the plain door) find it by Bonjour, or by
-address with the Mac viewer's `-SillConnect <pc-ip>:<port>` (the port is in the "Home door" line;
-`--port=N` fixes it). Windows Firewall asks the first time the host listens: allow "Private".
+Release builds of the apps (the App Store's, TestFlight's) dial only a TLS door: run
+`sill-host-windows.exe --pairing --port=7454` and pair with the code in the window (or on the
+console). Debug builds also dial the plain door, by Bonjour or by address with the Mac viewer's
+`-SillConnect <pc-ip>:<port>` (the port is in the "Home door" line; `--port=N` fixes it).
+
+The firewall: Windows may ask the first time the host listens (it did not here). A rule for the
+program never matches when the exe sits on a Dev Drive or any volume mounted in a folder (the
+filter compiles `C:\…` to the C: volume's path, the running exe is `\device\harddiskvolumeN\…`),
+and Windows then drops every connection in silence (`pktmon` shows "INET: accept inspection"; the
+mDNS answers still go out, so the device lists the PC and never reaches it). A port rule works
+anywhere, from an elevated PowerShell:
+
+```
+New-NetFirewallRule -DisplayName "Sill host" -Direction Inbound -Action Allow -Profile Private -Protocol TCP -LocalPort 7454
+```
+
+`SILL_DEBUG_DOOR=1` logs every connection at the door (NOTES-core.md): none at all while a device
+says it "didn't answer" is the firewall.
+
+If `link.exe` cannot open `msvcrt.lib`, the Visual Studio picked has no x64 C++ libraries: build
+inside the `vcvars64.bat` of an install that has them (Build Tools with the C++ workload).
 
 ## Requirements on the PC
 

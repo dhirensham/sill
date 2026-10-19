@@ -190,6 +190,9 @@ pub fn run(platform: Arc<dyn Platform>, opts: HostOptions) -> Result<(), String>
     let pairing = if opts.pairing || opts.remote.is_some() {
         let store = Store::open(opts.config_dir.clone())?;
         let p = Pairing::new(store, &name)?;
+        // The platform's own pairing window, if it has one, hears of every code (the console too).
+        let ui = platform.clone();
+        p.set_observer(move |event, control| ui.pairing_changed(event, control));
         log(&format!(
             "Identity: ID {} (key {}…), kept in {}",
             mac_id(&p.identity.fingerprint),

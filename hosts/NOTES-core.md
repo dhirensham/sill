@@ -2,6 +2,17 @@
 
 ## Status (newest first)
 
+- **2026-10-19, for the Windows pairing window and a first run on a PC:**
+  - `Platform::pairing_changed(event, control)` (additive, default no-op; "Trait changes"): every
+    change to the pairing window as a `PairingEvent` (a code with its link, expiry, asker, paired
+    count and host name; an ask; a device's own cancel; a wrong code; paired; stopped; cancelled),
+    and a `PairingControl` for a UI's buttons (`new_code`, `cancel`: the Mac's Cancel, the code
+    stops and the asker stays quiet 10 minutes). The console's lines are unchanged. Test
+    `pairing::tests::the_observer_hears_each_change_and_the_buttons_work`.
+  - `SILL_DEBUG_DOOR=1`: one line per connection at the TLS doors as it arrives (its origin), its
+    ClientHello's ALPN, the handshake, and how it ended (admitted, refused with the word, or gone and
+    why). Off by default; the Mac logs none of it. Found the PC's first failure: nothing reached the
+    door at all (the firewall, NOTES-windows.md), which no log said.
 - **2026-10-14, fixes from the Linux agent's findings:**
   - `FfmpegEncoder`: a keyframe asked for before the first frame made every frame an IDR (the
     first frame's odd timestamp became FFmpeg's start time, and FFmpeg shifts every timestamp by
@@ -290,6 +301,10 @@ input (they check the listener's arguments).
 
 ## Trait changes
 
+- 2026-10-19 (additive): `Platform::pairing_changed(&self, PairingEvent, Arc<dyn PairingControl>)`
+  with a default no-op, called from the core's threads (never under its locks) for each change to
+  the pairing window; `PairingEvent` and `PairingControl` are new in platform.rs. For a backend with
+  a window of its own (sill-host-windows' "Pair iPhone or iPad"); the console has every code anyway.
 - 2026-10-14 (additive): `Platform::release_all_input(&self)` with a default no-op. The core calls
   it once when it stops (after releasing each device's held keys and buttons through `inject`).
   Answers NOTES-windows.md request 1: per-device release is the core's (it tracks what each

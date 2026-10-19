@@ -8,6 +8,7 @@
 //! the code printed again. No USB-cable pairing (the Mac's rule reads its own IOKit), no lock check.
 
 use crate::log;
+use crate::platform::{PairingControl, PairingEvent};
 use sill_protocol::identity::{base64_std, base64url, mac_id, random_bytes, short_name, Identity};
 use sill_protocol::messages::{to_json, MacInfo, PairRequest, PairResult, SignedMacInfo};
 use sill_protocol::pairing::{self as proofs, generate_code, grouped, pair_link};
@@ -230,7 +231,11 @@ pub struct Pairing {
     pub link_port: u16,
     /// The remote door, once it listens.
     remote: Mutex<Option<RemoteDoor>>,
+    /// The host's own pairing UI, if its platform has one (`Platform::pairing_changed`).
+    observer: Mutex<Option<Observer>>,
 }
+
+type Observer = Arc<dyn Fn(PairingEvent, Arc<dyn PairingControl>) + Send + Sync>;
 
 const ASK_SPAN: Duration = Duration::from_secs(600);
 const ASK_MAX_WINDOWS: usize = 3;
@@ -249,7 +254,22 @@ impl Pairing {
             state: Mutex::new(State { window: None, closed: CloseReason::None, paired, opened_at: Vec::new(), quiet: HashMap::new() }),
             link_port: 7455,
             remote: Mutex::new(None),
+            observer: Mutex::new(None),
         }))
+    }
+
+    /// Who hears of every change to the pairing window (the platform's UI). Set before the first
+    /// window opens.
+    pub fn set_observer(&self, observer: impl Fn(PairingEvent, Arc<dyn PairingControl>) + Send + Sync + 'static) {
+        *self.observer.lock().unwrap() = Some(Arc::new(observer));
+    }
+
+    /// Tells the observer. Never called while `state` is locked: its handler may call back.
+    fn emit(self: &Arc<Self>, event: PairingEvent) {
+        let observer = self.observer.lock().unwrap().clone();
+        if let Some(o) = observer {
+            o(event, Arc::new(self.clone()));
+        }
     }
 
     /// The remote door listens (or stops: None). Windows opened from now on are its too.
@@ -352,13 +372,14 @@ impl Pairing {
         // for the home door alone, whose link names no address.
         let for_remote = door.is_some() && asked_by.is_none();
         let link = self.link_for(&secret, for_remote);
-        {
+        let lifetime = pairing_lifetime();
+        let paired = {
             let mut st = self.state.lock().unwrap();
             st.window = Some(Window {
                 secret,
                 code: code.clone(),
                 code_key: None,
-                expires_at: Instant::now() + pairing_lifetime(),
+                expires_at: Instant::now() + lifetime,
                 failures: 0,
                 next_allowed_at: Instant::now(),
                 last_attempt_by_source: HashMap::new(),
@@ -369,7 +390,8 @@ impl Pairing {
                 st.opened_at.retain(|t| t.elapsed() < ASK_SPAN);
                 st.opened_at.push(Instant::now());
             }
-        }
+            st.paired.len()
+        };
         // K for the typed path (PBKDF2, 600,000 rounds), off the caller's thread; a code proof
         // before it is ready is answered busy.
         let me = self.clone();
@@ -397,6 +419,14 @@ impl Pairing {
         } else {
             log(&format!("Pairing: new code {} or {link}", grouped(&code)));
         }
+        self.emit(PairingEvent::Code {
+            code,
+            link,
+            expires_in: lifetime,
+            asked_by: asked_by.map(|(_, who)| who.to_string()),
+            paired,
+            host: self.name.clone(),
+        });
     }
 
     /// A window's link: the remote door's port and addresses (at most 5) when it runs for it.
@@ -411,11 +441,12 @@ impl Pairing {
     }
 
     /// The open window's code again (an ask while it is up).
-    fn offer_again(&self, who: &str) {
+    fn offer_again(self: &Arc<Self>, who: &str) {
         let open = self.state.lock().unwrap().window.as_ref().map(|w| (w.secret.clone(), w.for_remote, w.code.clone()));
         if let Some((secret, for_remote, code)) = open {
             let link = self.link_for(&secret, for_remote);
             log(&format!("Pairing: {who} asked; code {} or {link}", grouped(&code)));
+            self.emit(PairingEvent::Asked { device: who.to_string() });
         }
     }
 
@@ -463,6 +494,7 @@ impl Pairing {
                 st.closed = CloseReason::Withdrawn;
                 drop(st);
                 log(&format!("Pairing: {who} at {} no longer needs its code; the window closed.", a.display));
+                self.emit(PairingEvent::Withdrawn { device: who.clone() });
                 self.open_window(None, false);
             }
             return PairResult::refused(PairResult::CLOSED);
@@ -506,6 +538,7 @@ impl Pairing {
                     a.display,
                     if r.method == PairRequest::QR { "the QR code" } else { "the code" }
                 ));
+                self.emit(PairingEvent::Paired { device: device.display_name() });
                 self.open_window(None, false);
                 PairResult {
                     ok: true,
@@ -518,12 +551,14 @@ impl Pairing {
             }
             Verdict::Reject(left) => {
                 log(&format!("Pairing: a wrong code from {} ({left} tr{} left).", a.display, if left == 1 { "y" } else { "ies" }));
+                self.emit(PairingEvent::WrongCode { device: who, tries_left: left });
                 PairResult { tries_left: Some(left as i64), ..PairResult::refused(PairResult::CODE) }
             }
             Verdict::Busy(after) => PairResult { retry_after: Some((after * 10.0).ceil() / 10.0), ..PairResult::refused(PairResult::BUSY) },
             Verdict::Closed(reason) => {
                 if was_open && reason == CloseReason::Stopped {
                     log(&format!("Pairing stopped after {MAX_FAILURES} wrong codes."));
+                    self.emit(PairingEvent::Stopped);
                 }
                 if was_open && reason == CloseReason::Expired {
                     self.open_window(None, false);
@@ -573,6 +608,33 @@ impl Pairing {
                 log(&format!("Pairing: {who} at {} asked to pair; not shown ({why}).", a.display));
                 PairResult::refused(PairResult::OPEN_ON_MAC)
             }
+        }
+    }
+}
+
+/// The pairing window's buttons (a platform's UI).
+impl PairingControl for Arc<Pairing> {
+    fn new_code(&self) {
+        self.open_window(None, false);
+    }
+
+    fn cancel(&self) {
+        let cancelled = {
+            let mut st = self.state.lock().unwrap();
+            match st.window.take() {
+                Some(w) => {
+                    if let Some(asker) = w.by_device {
+                        st.quiet.insert(base64url::encode(&asker), Instant::now());
+                    }
+                    st.closed = CloseReason::Stopped;
+                    true
+                }
+                None => false,
+            }
+        };
+        if cancelled {
+            log("Pairing: the code was cancelled on this computer; none works until a new one or a device's ask.");
+            self.emit(PairingEvent::Cancelled);
         }
     }
 }
@@ -717,6 +779,67 @@ mod tests {
         let mut ask = attempt("ask", &[], [9u8; 32], "h");
         ask.request.proof = String::new();
         assert_eq!(p.judge(&ask).reason.as_deref(), Some("shown"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_observer_hears_each_change_and_the_buttons_work() {
+        let (p, dir) = pairing();
+        let events: Arc<Mutex<Vec<PairingEvent>>> = Arc::default();
+        let control: Arc<Mutex<Option<Arc<dyn PairingControl>>>> = Arc::default();
+        let (e, c) = (events.clone(), control.clone());
+        p.set_observer(move |event, ctl| {
+            e.lock().unwrap().push(event);
+            *c.lock().unwrap() = Some(ctl);
+        });
+        let kinds = |v: &[PairingEvent]| -> Vec<&'static str> {
+            v.iter()
+                .map(|e| match e {
+                    PairingEvent::Code { asked_by: None, .. } => "code",
+                    PairingEvent::Code { asked_by: Some(_), .. } => "code-asked",
+                    PairingEvent::Asked { .. } => "asked",
+                    PairingEvent::Withdrawn { .. } => "withdrawn",
+                    PairingEvent::WrongCode { .. } => "wrong",
+                    PairingEvent::Paired { .. } => "paired",
+                    PairingEvent::Stopped => "stopped",
+                    PairingEvent::Cancelled => "cancelled",
+                })
+                .collect()
+        };
+        p.open_window(None, true);
+        let (code, link, paired) = match &events.lock().unwrap()[0] {
+            PairingEvent::Code { code, link, paired, .. } => (code.clone(), link.clone(), *paired),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!((code.len(), paired), (12, 0));
+        assert!(link.starts_with("sill://pair?"), "{link}");
+        // A wrong proof, then the right one: the device's name in both, then a fresh code.
+        let dev = [3u8; 32];
+        p.judge(&attempt("qr", &[0u8; 32], dev, "10.0.0.2"));
+        if let Some(w) = p.state.lock().unwrap().window.as_mut() {
+            w.next_allowed_at = Instant::now();
+        }
+        let secret = p.state.lock().unwrap().window.as_ref().unwrap().secret.clone();
+        let proof = proofs::device_proof(&secret, &dev, &p.identity.fingerprint);
+        assert!(p.judge(&attempt("qr", &proof, dev, "10.0.0.3")).ok);
+        assert_eq!(kinds(&events.lock().unwrap()), ["code", "wrong", "paired", "code"]);
+        assert!(matches!(&events.lock().unwrap()[1], PairingEvent::WrongCode { device, tries_left: 4 } if device == "iPad (iPad14,1)"));
+        assert!(matches!(&events.lock().unwrap()[3], PairingEvent::Code { paired: 1, .. }));
+        // Cancel: no code works; the device whose ask opened it stays quiet; New Code opens one.
+        let ctl = control.lock().unwrap().clone().unwrap();
+        ctl.cancel();
+        assert!(p.state.lock().unwrap().window.is_none());
+        let mut ask = attempt("ask", &[], [9u8; 32], "10.0.0.9");
+        ask.request.proof = String::new();
+        assert_eq!(p.judge(&ask).reason.as_deref(), Some("shown"));
+        ctl.cancel();
+        assert_eq!(p.judge(&ask).reason.as_deref(), Some("openOnMac"));
+        ctl.new_code();
+        assert!(p.state.lock().unwrap().window.is_some());
+        assert_eq!(
+            kinds(&events.lock().unwrap())[4..],
+            ["cancelled", "code-asked", "cancelled", "code"]
+        );
         let _ = fs::remove_dir_all(dir);
     }
 
